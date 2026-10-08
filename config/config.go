@@ -14,6 +14,11 @@ type Config struct {
 	SupabaseServiceRoleKey string
 	InviteBaseURL          string
 	CORSOrigins            string
+	SMTPHost               string
+	SMTPPort               string
+	SMTPUsername           string
+	SMTPPassword           string
+	SMTPFrom               string
 }
 
 func Load() (Config, error) {
@@ -43,5 +48,18 @@ func Load() (Config, error) {
 		SupabaseServiceRoleKey: os.Getenv("SUPABASE_SERVICE_ROLE_KEY"),
 		InviteBaseURL:          os.Getenv("INVITE_REDIRECT_URL"),
 		CORSOrigins:            origins,
+		SMTPHost:               os.Getenv("SMTP_HOST"),
+		SMTPPort:               envOrDefault("SMTP_PORT", "587"),
+		SMTPUsername:           os.Getenv("SMTP_USERNAME"),
+		SMTPPassword:           os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:               os.Getenv("SMTP_FROM"),
 	}, nil
+}
+
+func envOrDefault(name, fallback string) string {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	return value
 }

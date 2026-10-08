@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 )
 
@@ -35,8 +34,31 @@ type HTTPError struct {
 }
 
 type AuthUser struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
+	ID           string         `json:"id"`
+	Email        string         `json:"email"`
+	UserMetadata map[string]any `json:"user_metadata"`
+}
+
+type InviteLink struct {
+	ActionLink string   `json:"action_link"`
+	URL        string   `json:"url"`
+	ID         string   `json:"id"`
+	Email      string   `json:"email"`
+	User       AuthUser `json:"user"`
+}
+
+func (i *InviteLink) UserID() string {
+	if i.ID != "" {
+		return i.ID
+	}
+	return i.User.ID
+}
+
+func (i *InviteLink) Link() string {
+	if i.ActionLink != "" {
+		return i.ActionLink
+	}
+	return i.URL
 }
 
 func (err *HTTPError) Error() string {
@@ -59,13 +81,15 @@ func (client *SupabaseClient) request(ctx context.Context, method, path, accessT
 	}
 	req.Header.Set("apikey", client.apiKey)
 	req.Header.Set("Accept", "application/json")
-	if accessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+accessToken)
+	token := accessToken
+	if token == "" {
+		token = client.apiKey
 	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if method == http.MethodPost || method == http.MethodPatch {
+	if method == http.MethodPost || method == http.MethodPatch || method == http.MethodPut {
 		req.Header.Set("Prefer", "return=representation")
 	}
 
@@ -99,12 +123,30 @@ func (client *SupabaseClient) AuthUser(ctx context.Context, accessToken string, 
 	return client.request(ctx, http.MethodGet, "/auth/v1/user", accessToken, nil, result)
 }
 
-func (client *SupabaseClient) InviteUser(ctx context.Context, email, redirectTo string, result any) error {
-	path := "/auth/v1/invite"
+func (client *SupabaseClient) GenerateInviteLink(ctx context.Context, email, redirectTo string, metadata map[string]any, result *InviteLink) error {
+	return client.GenerateAuthLink(ctx, "invite", email, redirectTo, metadata, result)
+}
+
+func (client *SupabaseClient) GenerateAuthLink(ctx context.Context, linkType, email, redirectTo string, metadata map[string]any, result *InviteLink) error {
+	payload := map[string]any{"type": linkType, "email": email}
 	if redirectTo != "" {
-		path += "?redirect_to=" + url.QueryEscape(redirectTo)
+		payload["redirect_to"] = redirectTo
 	}
-	return client.request(ctx, http.MethodPost, path, client.apiKey, map[string]any{"email": email}, result)
+	if len(metadata) > 0 {
+		payload["data"] = metadata
+	}
+	return client.request(ctx, http.MethodPost, "/auth/v1/admin/generate_link", client.apiKey, payload, result)
+}
+
+func (client *SupabaseClient) UpdateAdminUser(ctx context.Context, userID string, payload map[string]any, result any) error {
+	return client.request(ctx, http.MethodPut, "/auth/v1/admin/users/"+userID, client.apiKey, payload, result)
+}
+
+func (client *SupabaseClient) PasswordLogin(ctx context.Context, email, password string, result any) error {
+	return client.request(ctx, http.MethodPost, "/auth/v1/token?grant_type=password", "", map[string]string{
+		"email":    email,
+		"password": password,
+	}, result)
 }
 
 func (client *SupabaseClient) Get(ctx context.Context, path, accessToken string, result any) error {
@@ -118,3 +160,34 @@ func (client *SupabaseClient) Post(ctx context.Context, path, accessToken string
 func (client *SupabaseClient) Patch(ctx context.Context, path, accessToken string, payload, result any) error {
 	return client.request(ctx, http.MethodPatch, "/rest/v1"+path, accessToken, payload, result)
 }
+
+func (client *SupabaseClient) Delete(ctx context.Context, path, accessToken string, result any) error {
+	return client.request(ctx, http.MethodDelete, "/rest/v1"+path, accessToken, nil, result)
+}
+
+func (client *SupabaseClient) UploadStorage(ctx context.Context, bucket, objectPath, contentType string, data []byte) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/storage/v1/object/%s/%s", client.baseURL, bucket, objectPath), bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("apikey", client.apiKey)
+	req.Header.Set("Authorization", "Bearer "+client.apiKey)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("x-upsert", "true")
+
+	resp, err := client.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", &HTTPError{Status: resp.StatusCode, Message: string(respBody)}
+	}
+
+	publicURL := fmt.Sprintf("%s/storage/v1/object/public/%s/%s", client.baseURL, bucket, objectPath)
+	return publicURL, nil
+}
+
+

@@ -10,8 +10,11 @@ import (
 )
 
 type User struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
+	ID           string         `json:"id"`
+	Email        string         `json:"email"`
+	FullName     string         `json:"full_name"`
+	Username     string         `json:"username"`
+	UserMetadata map[string]any `json:"user_metadata"`
 }
 
 func RequireAuth(client *services.SupabaseClient) fiber.Handler {
@@ -32,6 +35,24 @@ func RequireAuth(client *services.SupabaseClient) fiber.Handler {
 			}
 			return fiber.NewError(fiber.StatusServiceUnavailable, "Supabase tidak dapat dihubungi.")
 		}
+
+		if user.FullName == "" && user.UserMetadata != nil {
+			if fn, ok := user.UserMetadata["full_name"].(string); ok && strings.TrimSpace(fn) != "" {
+				user.FullName = strings.TrimSpace(fn)
+			} else if n, ok := user.UserMetadata["name"].(string); ok && strings.TrimSpace(n) != "" {
+				user.FullName = strings.TrimSpace(n)
+			}
+		}
+		if user.Username == "" && user.UserMetadata != nil {
+			if un, ok := user.UserMetadata["username"].(string); ok && strings.TrimSpace(un) != "" {
+				user.Username = strings.TrimSpace(un)
+			}
+		}
+		if user.Username == "" && user.Email != "" {
+			parts := strings.Split(user.Email, "@")
+			user.Username = parts[0]
+		}
+
 		ctx.Locals("access_token", accessToken)
 		ctx.Locals("user", user)
 		return ctx.Next()

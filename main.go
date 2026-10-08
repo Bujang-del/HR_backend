@@ -20,6 +20,7 @@ func main() {
 	app := fiber.New(fiber.Config{ErrorHandler: controllers.ErrorHandler})
 	userClient := services.NewSupabaseClient(cfg.SupabaseURL, cfg.SupabaseAnonKey)
 	adminClient := services.NewSupabaseAdminClient(cfg.SupabaseURL, cfg.SupabaseServiceRoleKey)
-	routes.Register(app, userClient, adminClient, cfg.InviteBaseURL, cfg.CORSOrigins)
+	mailer := services.NewSMTPMailer(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.SMTPFrom)
+	routes.Register(app, userClient, adminClient, mailer, cfg.InviteBaseURL, cfg.CORSOrigins)
 	log.Fatal(app.Listen(":" + cfg.Port))
 }
