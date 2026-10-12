@@ -111,6 +111,9 @@ type membership struct {
 	ManagedDepartments []departmentSummary `json:"managed_departments"`
 	ShiftID            *string             `json:"shift_id"`
 	Shift              *shiftSummary       `json:"shift"`
+	LeaveQuota         int                 `json:"leave_quota"`
+	LeaveTaken         int                 `json:"leave_taken"`
+	LeaveBalance       int                 `json:"leave_balance"`
 }
 
 type profile struct {
@@ -155,7 +158,7 @@ type importResult struct {
 }
 
 func (api *API) Health(ctx *fiber.Ctx) error {
-	return ctx.JSON(fiber.Map{"status": "ok"})
+	return ctx.JSON(fiber.Map{"status": "ok", "version": "v2_fixed"})
 }
 
 func (api *API) Login(ctx *fiber.Ctx) error {
@@ -244,6 +247,9 @@ func (api *API) Me(ctx *fiber.Ctx) error {
 			"managed_department": managedDept,
 			"shift_id":           m.ShiftID,
 			"shift":              m.Shift,
+			"leave_quota":        m.LeaveQuota,
+			"leave_taken":        m.LeaveTaken,
+			"leave_balance":      m.LeaveBalance,
 		},
 	})
 }
@@ -960,6 +966,29 @@ func (api *API) currentMembership(ctx *fiber.Ctx) (membership, error) {
 				WorkDays:             []int{1, 2, 3, 4, 5},
 				IsDefault:            true,
 			}
+		}
+	}
+
+	// Populate leave quota (default 12 hari jika belum termigrasi)
+	memberships[0].LeaveQuota = 12
+	memberships[0].LeaveBalance = 12
+	var leaveData []struct {
+		LeaveQuota   *int `json:"leave_quota"`
+		LeaveTaken   *int `json:"leave_taken"`
+		LeaveBalance *int `json:"leave_balance"`
+	}
+	leavePath := "/company_members?id=eq." + url.QueryEscape(memberships[0].MemberID) + "&select=leave_quota,leave_taken,leave_balance&limit=1"
+	if err := client.Get(ctx.Context(), leavePath, token, &leaveData); err == nil && len(leaveData) > 0 {
+		if leaveData[0].LeaveQuota != nil {
+			memberships[0].LeaveQuota = *leaveData[0].LeaveQuota
+		}
+		if leaveData[0].LeaveTaken != nil {
+			memberships[0].LeaveTaken = *leaveData[0].LeaveTaken
+		}
+		if leaveData[0].LeaveBalance != nil {
+			memberships[0].LeaveBalance = *leaveData[0].LeaveBalance
+		} else {
+			memberships[0].LeaveBalance = memberships[0].LeaveQuota - memberships[0].LeaveTaken
 		}
 	}
 
@@ -1816,6 +1845,517 @@ func (api *API) ReviewAttendance(ctx *fiber.Ctx) error {
 		"approval_status": body.ApprovalStatus,
 	})
 }
+
+// ==========================================
+// FITUR PENGAJUAN & MANAJEMEN CUTI
+// ==========================================
+
+func (api *API) GetMyLeaveBalance(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+	var memberData []struct {
+		LeaveQuota   *int `json:"leave_quota"`
+		LeaveTaken   *int `json:"leave_taken"`
+		LeaveBalance *int `json:"leave_balance"`
+	}
+	path := "/company_members?id=eq." + url.QueryEscape(m.MemberID) + "&select=leave_quota,leave_taken,leave_balance&limit=1"
+	if err := admin.Get(ctx.Context(), path, "", &memberData); err != nil || len(memberData) == 0 {
+		return ctx.JSON(fiber.Map{
+			"leave_quota":   12,
+			"leave_taken":   0,
+			"leave_balance": 12,
+		})
+	}
+	quota := 12
+	taken := 0
+	balance := 12
+	if memberData[0].LeaveQuota != nil {
+		quota = *memberData[0].LeaveQuota
+	}
+	if memberData[0].LeaveTaken != nil {
+		taken = *memberData[0].LeaveTaken
+	}
+	if memberData[0].LeaveBalance != nil {
+		balance = *memberData[0].LeaveBalance
+	} else {
+		balance = quota - taken
+	}
+	return ctx.JSON(fiber.Map{
+		"leave_quota":   quota,
+		"leave_taken":   taken,
+		"leave_balance": balance,
+	})
+}
+
+type createLeaveInput struct {
+	LeaveType string `json:"leave_type"`
+	StartDate string `json:"start_date"`
+	EndDate   string `json:"end_date"`
+	TotalDays int    `json:"total_days"`
+	Reason    string `json:"reason"`
+}
+
+func (api *API) CreateLeaveRequest(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	var input createLeaveInput
+	if err := ctx.BodyParser(&input); err != nil {
+		return fiber.ErrBadRequest
+	}
+	if strings.TrimSpace(input.Reason) == "" || strings.TrimSpace(input.StartDate) == "" || strings.TrimSpace(input.EndDate) == "" || input.TotalDays <= 0 {
+		return fiber.NewError(http.StatusBadRequest, "Semua data pengajuan cuti wajib diisi dengan benar.")
+	}
+	if input.LeaveType == "" {
+		input.LeaveType = "cuti_tahunan"
+	}
+
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	// Validasi sisa kuota jika jenis cuti tahunan
+	if input.LeaveType == "cuti_tahunan" {
+		var memberData []struct {
+			LeaveQuota   *int `json:"leave_quota"`
+			LeaveTaken   *int `json:"leave_taken"`
+			LeaveBalance *int `json:"leave_balance"`
+		}
+		path := "/company_members?id=eq." + url.QueryEscape(m.MemberID) + "&select=leave_quota,leave_taken,leave_balance&limit=1"
+		if err := admin.Get(ctx.Context(), path, "", &memberData); err == nil && len(memberData) > 0 {
+			quota := 12
+			taken := 0
+			balance := 12
+			if memberData[0].LeaveQuota != nil {
+				quota = *memberData[0].LeaveQuota
+			}
+			if memberData[0].LeaveTaken != nil {
+				taken = *memberData[0].LeaveTaken
+			}
+			if memberData[0].LeaveBalance != nil {
+				balance = *memberData[0].LeaveBalance
+			} else {
+				balance = quota - taken
+			}
+			if input.TotalDays > balance {
+				return fiber.NewError(http.StatusBadRequest, fmt.Sprintf("Jatah cuti tidak mencukupi. Sisa jatah cuti Anda: %d hari.", balance))
+			}
+		}
+	}
+
+	user := middleware.CurrentUser(ctx)
+	payload := fiber.Map{
+		"company_id":  m.CompanyID,
+		"member_id":   m.MemberID,
+		"user_id":     user.ID,
+		"leave_type":  input.LeaveType,
+		"start_date":  input.StartDate,
+		"end_date":    input.EndDate,
+		"total_days":  input.TotalDays,
+		"reason":      strings.TrimSpace(input.Reason),
+		"status":      "pending_manager",
+	}
+
+	var created []map[string]any
+	if err := admin.Post(ctx.Context(), "/leave_requests?select=*", "", payload, &created); err != nil {
+		return err
+	}
+	if len(created) == 0 {
+		return fiber.ErrInternalServerError
+	}
+	return ctx.Status(http.StatusCreated).JSON(created[0])
+}
+
+func (api *API) GetMyLeaveRequests(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+	var list []map[string]any
+	path := "/leave_requests?member_id=eq." + url.QueryEscape(m.MemberID) + "&order=created_at.desc"
+	if err := admin.Get(ctx.Context(), path, "", &list); err != nil {
+		return err
+	}
+	return ctx.JSON(list)
+}
+
+func (api *API) GetManagerPendingLeaves(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	if len(m.ManagedDepartments) == 0 {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	managedDeptIDs := make([]string, len(m.ManagedDepartments))
+	for i, d := range m.ManagedDepartments {
+		managedDeptIDs[i] = d.ID
+	}
+
+	deptFilter := strings.Join(managedDeptIDs, ",")
+	membersPath := "/company_members?department_id=in.(" + deptFilter + ")&id=neq." + url.QueryEscape(m.MemberID) +
+		"&select=id,user_id,position_title,department_id,leave_quota,leave_taken,leave_balance,profiles(email,full_name),department:departments!company_members_department_id_fkey(name,code)"
+	var members []map[string]any
+	if err := admin.Get(ctx.Context(), membersPath, "", &members); err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		return ctx.JSON([]any{})
+	}
+
+	memberMap := make(map[string]map[string]any)
+	memberIDs := make([]string, 0, len(members))
+	for _, mb := range members {
+		if id, ok := mb["id"].(string); ok {
+			memberIDs = append(memberIDs, id)
+			memberMap[id] = mb
+		}
+	}
+
+	if len(memberIDs) == 0 {
+		return ctx.JSON([]any{})
+	}
+
+	leavesPath := "/leave_requests?member_id=in.(" + strings.Join(memberIDs, ",") + ")&status=eq.pending_manager&order=created_at.desc"
+	var leaves []map[string]any
+	if err := admin.Get(ctx.Context(), leavesPath, "", &leaves); err != nil {
+		return err
+	}
+
+	for i := range leaves {
+		mID, _ := leaves[i]["member_id"].(string)
+		if mb, found := memberMap[mID]; found {
+			leaves[i]["member"] = mb
+		}
+	}
+
+	return ctx.JSON(leaves)
+}
+
+type managerReviewLeaveInput struct {
+	Action string `json:"action"` // "approve" atau "reject"
+	Notes  string `json:"notes"`
+}
+
+func (api *API) ReviewLeaveByManager(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	if len(m.ManagedDepartments) == 0 {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
+	}
+	var input managerReviewLeaveInput
+	if err := ctx.BodyParser(&input); err != nil || (input.Action != "approve" && input.Action != "reject") {
+		return fiber.NewError(http.StatusBadRequest, "Action harus 'approve' atau 'reject'.")
+	}
+
+	leaveID := ctx.Params("id")
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	var leaves []map[string]any
+	if err := admin.Get(ctx.Context(), "/leave_requests?id=eq."+url.QueryEscape(leaveID)+"&limit=1", "", &leaves); err != nil || len(leaves) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan cuti tidak ditemukan.")
+	}
+	leave := leaves[0]
+	applicantMemberID, _ := leave["member_id"].(string)
+	leaveType, _ := leave["leave_type"].(string)
+	totalDaysVal := leave["total_days"]
+	totalDays := 0
+	switch v := totalDaysVal.(type) {
+	case float64:
+		totalDays = int(v)
+	case int:
+		totalDays = v
+	}
+
+	user := middleware.CurrentUser(ctx)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if input.Action == "approve" {
+		// 1. Jika cuti tahunan, potong jatah cuti karyawan terkait
+		if leaveType == "cuti_tahunan" && totalDays > 0 {
+			var memberData []struct {
+				LeaveQuota *int `json:"leave_quota"`
+				LeaveTaken *int `json:"leave_taken"`
+			}
+			_ = admin.Get(ctx.Context(), "/company_members?id=eq."+url.QueryEscape(applicantMemberID)+"&select=leave_quota,leave_taken&limit=1", "", &memberData)
+			quota := 12
+			taken := 0
+			if len(memberData) > 0 {
+				if memberData[0].LeaveQuota != nil {
+					quota = *memberData[0].LeaveQuota
+				}
+				if memberData[0].LeaveTaken != nil {
+					taken = *memberData[0].LeaveTaken
+				}
+			}
+			newTaken := taken + totalDays
+			newBalance := quota - newTaken
+			if newBalance < 0 {
+				return fiber.NewError(http.StatusBadRequest, "Jatah cuti karyawan tidak mencukupi untuk disetujui.")
+			}
+			_ = admin.Patch(ctx.Context(), "/company_members?id=eq."+url.QueryEscape(applicantMemberID), "", fiber.Map{
+				"leave_taken":   newTaken,
+				"leave_balance": newBalance,
+			}, nil)
+		}
+
+		// 2. Update status permohonan menjadi approved_manager (diteruskan ke laporan HR)
+		updatePayload := fiber.Map{
+			"status":            "approved_manager",
+			"manager_id":        m.MemberID,
+			"manager_name":      user.FullName,
+			"manager_notes":     strings.TrimSpace(input.Notes),
+			"manager_action_at": now,
+			"updated_at":        now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/leave_requests?id=eq."+url.QueryEscape(leaveID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+		return ctx.JSON(fiber.Map{
+			"message": "Pengajuan cuti berhasil disetujui manajer dan laporan izin diteruskan ke HR.",
+			"data":    firstMap(updated),
+		})
+	} else {
+		updatePayload := fiber.Map{
+			"status":            "rejected",
+			"manager_id":        m.MemberID,
+			"manager_name":      user.FullName,
+			"manager_notes":     strings.TrimSpace(input.Notes),
+			"manager_action_at": now,
+			"updated_at":        now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/leave_requests?id=eq."+url.QueryEscape(leaveID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+		return ctx.JSON(fiber.Map{
+			"message": "Pengajuan cuti telah ditolak manajer.",
+			"data":    firstMap(updated),
+		})
+	}
+}
+
+func (api *API) ListCompanyLeaves(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	statusFilter := ctx.Query("status")
+	leavesPath := "/leave_requests?company_id=eq." + url.QueryEscape(m.CompanyID)
+	if statusFilter != "" && statusFilter != "all" {
+		leavesPath += "&status=eq." + url.QueryEscape(statusFilter)
+	}
+	leavesPath += "&order=created_at.desc"
+
+	var leaves []map[string]any
+	if err := admin.Get(ctx.Context(), leavesPath, "", &leaves); err != nil {
+		return err
+	}
+
+	// Ambil semua company_members dari company ini untuk mapping informasi member & departemen tanpa bergantung pada PostgREST join embedding
+	membersPath := "/company_members?company_id=eq." + url.QueryEscape(m.CompanyID) +
+		"&select=id,position_title,leave_quota,leave_taken,leave_balance,profiles(email,full_name),department:departments(id,name,code)"
+	var members []map[string]any
+	_ = admin.Get(ctx.Context(), membersPath, "", &members)
+
+	memberMap := make(map[string]map[string]any)
+	for _, mb := range members {
+		if id, ok := mb["id"].(string); ok {
+			memberMap[id] = mb
+		}
+	}
+
+	result := make([]map[string]any, len(leaves))
+	for i, l := range leaves {
+		item := make(map[string]any)
+		for k, v := range l {
+			item[k] = v
+		}
+
+		// Defaults
+		item["member_name"] = ""
+		item["member_email"] = ""
+		item["department_name"] = ""
+		item["leave_quota"] = 12
+		item["leave_taken"] = 0
+		item["leave_balance"] = 12
+
+		mID, _ := l["member_id"].(string)
+		if mb, found := memberMap[mID]; found {
+			item["member"] = mb
+			if q, ok := mb["leave_quota"].(float64); ok {
+				item["leave_quota"] = int(q)
+			}
+			if t, ok := mb["leave_taken"].(float64); ok {
+				item["leave_taken"] = int(t)
+			}
+			if b, ok := mb["leave_balance"].(float64); ok {
+				item["leave_balance"] = int(b)
+			} else {
+				item["leave_balance"] = item["leave_quota"].(int) - item["leave_taken"].(int)
+			}
+
+			if prof, ok := mb["profiles"].(map[string]any); ok {
+				if fn, ok := prof["full_name"].(string); ok && fn != "" {
+					item["member_name"] = fn
+				}
+				if em, ok := prof["email"].(string); ok {
+					item["member_email"] = em
+					if item["member_name"] == "" {
+						item["member_name"] = em
+					}
+				}
+			}
+
+			if dept, ok := mb["department"].(map[string]any); ok {
+				if dn, ok := dept["name"].(string); ok {
+					item["department_name"] = dn
+				}
+			}
+		}
+
+		result[i] = item
+	}
+
+	return ctx.JSON(fiber.Map{
+		"data": result,
+	})
+}
+
+type hrReviewLeaveInput struct {
+	Action string `json:"action"` // "confirm" / "approve" atau "reject"
+	Notes  string `json:"notes"`
+}
+
+func (api *API) ReviewLeaveByHR(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	var input hrReviewLeaveInput
+	if err := ctx.BodyParser(&input); err != nil || (input.Action != "confirm" && input.Action != "approve" && input.Action != "reject") {
+		return fiber.NewError(http.StatusBadRequest, "Action harus 'confirm', 'approve', atau 'reject'.")
+	}
+
+	leaveID := ctx.Params("id")
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	var leaves []map[string]any
+	if err := admin.Get(ctx.Context(), "/leave_requests?id=eq."+url.QueryEscape(leaveID)+"&limit=1", "", &leaves); err != nil || len(leaves) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan cuti tidak ditemukan.")
+	}
+	leave := leaves[0]
+	applicantMemberID, _ := leave["member_id"].(string)
+	leaveType, _ := leave["leave_type"].(string)
+	prevStatus, _ := leave["status"].(string)
+	totalDaysVal := leave["total_days"]
+	totalDays := 0
+	switch v := totalDaysVal.(type) {
+	case float64:
+		totalDays = int(v)
+	case int:
+		totalDays = v
+	}
+
+	user := middleware.CurrentUser(ctx)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if input.Action == "confirm" || input.Action == "approve" {
+		updatePayload := fiber.Map{
+			"status":       "approved",
+			"hr_id":        m.MemberID,
+			"hr_name":      user.FullName,
+			"hr_notes":     strings.TrimSpace(input.Notes),
+			"hr_action_at": now,
+			"updated_at":   now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/leave_requests?id=eq."+url.QueryEscape(leaveID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+		return ctx.JSON(fiber.Map{
+			"message": "Laporan cuti berhasil diverifikasi dan disetujui oleh HR.",
+			"data":    firstMap(updated),
+		})
+	} else {
+		// Jika sebelumnya jatah cuti sempat dipotong saat disetujui manajer, kembalikan jatah cutinya
+		if prevStatus == "approved_manager" && leaveType == "cuti_tahunan" && totalDays > 0 {
+			var memberData []struct {
+				LeaveQuota *int `json:"leave_quota"`
+				LeaveTaken *int `json:"leave_taken"`
+			}
+			_ = admin.Get(ctx.Context(), "/company_members?id=eq."+url.QueryEscape(applicantMemberID)+"&select=leave_quota,leave_taken&limit=1", "", &memberData)
+			quota := 12
+			taken := 0
+			if len(memberData) > 0 {
+				if memberData[0].LeaveQuota != nil {
+					quota = *memberData[0].LeaveQuota
+				}
+				if memberData[0].LeaveTaken != nil {
+					taken = *memberData[0].LeaveTaken
+				}
+			}
+			newTaken := taken - totalDays
+			if newTaken < 0 {
+				newTaken = 0
+			}
+			newBalance := quota - newTaken
+			_ = admin.Patch(ctx.Context(), "/company_members?id=eq."+url.QueryEscape(applicantMemberID), "", fiber.Map{
+				"leave_taken":   newTaken,
+				"leave_balance": newBalance,
+			}, nil)
+		}
+
+		updatePayload := fiber.Map{
+			"status":       "rejected",
+			"hr_id":        m.MemberID,
+			"hr_name":      user.FullName,
+			"hr_notes":     strings.TrimSpace(input.Notes),
+			"hr_action_at": now,
+			"updated_at":   now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/leave_requests?id=eq."+url.QueryEscape(leaveID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+		return ctx.JSON(fiber.Map{
+			"message": "Permohonan cuti telah ditolak oleh HR.",
+			"data":    firstMap(updated),
+		})
+	}
+}
+
 
 func ErrorHandler(ctx *fiber.Ctx, err error) error {
 	status := fiber.StatusInternalServerError
