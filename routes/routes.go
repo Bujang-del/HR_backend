@@ -49,6 +49,21 @@ func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mail
 	protected.Get("/leaves/manager/pending", api.GetManagerPendingLeaves)
 	protected.Patch("/leaves/manager/review/:id", api.ReviewLeaveByManager)
 
+	// Presensi WFA (Work From Anywhere) & Task Board Trello
+	protected.Post("/wfa/requests", api.CreateWFARequest)
+	protected.Post("/wfa/request", api.CreateWFARequest)
+	protected.Post("/wfarequests", api.CreateWFARequest)
+	protected.Get("/wfa/my", api.GetMyWFARequests)
+	protected.Get("/wfa/today", api.GetTodayWFARequest)
+	protected.Patch("/wfa/tasks/:taskId/status", api.UpdateWFATaskStatus)
+	protected.Post("/wfa/tasks/:taskId/upload-proof", api.UploadTaskProof)
+	protected.Post("/wfa/requests/:id/submit-completion", api.SubmitWFACompletion)
+
+	// Approval WFA oleh Manager
+	protected.Get("/wfa/manager/pending", api.GetManagerPendingWFARequests)
+	protected.Patch("/wfa/manager/review/:id", api.ReviewWFAByManager)
+	protected.Post("/wfa/manager/requests/:id/approve-completion", api.ApproveWFACompletionByManager)
+
 	// Rute Khusus HR (Web Dashboard)
 	requireHR := middleware.RequireHR(client)
 	protected.Get("/companies/current", requireHR, api.CurrentCompany)
@@ -66,6 +81,8 @@ func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mail
 	protected.Patch("/companies/current/attendances/:id/review", requireHR, api.ReviewAttendance)
 	protected.Get("/companies/current/leaves", requireHR, api.ListCompanyLeaves)
 	protected.Patch("/companies/current/leaves/:id/review", requireHR, api.ReviewLeaveByHR)
+	protected.Get("/companies/current/wfa-requests", requireHR, api.ListCompanyWFARequests)
+	protected.Patch("/companies/current/wfa-requests/:id/review", requireHR, api.ReviewWFAByHR)
 }
 
 

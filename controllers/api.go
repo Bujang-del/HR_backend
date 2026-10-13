@@ -2356,6 +2356,834 @@ func (api *API) ReviewLeaveByHR(ctx *fiber.Ctx) error {
 	}
 }
 
+// ==========================================
+// SISTEM PRESENSI WFA (Work From Anywhere)
+// ==========================================
+
+type createWFARequestInput struct {
+	Date   string `json:"date"`
+	Reason string `json:"reason"`
+	Tasks  []struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	} `json:"tasks"`
+}
+
+func (api *API) CreateWFARequest(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	var input createWFARequestInput
+	if err := ctx.BodyParser(&input); err != nil {
+		return fiber.NewError(http.StatusBadRequest, "Format payload tidak valid.")
+	}
+	input.Date = strings.TrimSpace(input.Date)
+	input.Reason = strings.TrimSpace(input.Reason)
+	if input.Date == "" {
+		return fiber.NewError(http.StatusBadRequest, "Tanggal WFA wajib diisi.")
+	}
+	if len(input.Reason) < 3 {
+		return fiber.NewError(http.StatusBadRequest, "Alasan permohonan WFA minimal 3 karakter.")
+	}
+	if len(input.Tasks) == 0 {
+		return fiber.NewError(http.StatusBadRequest, "Harap cantumkan minimal 1 task yang akan dikerjakan selama WFA.")
+	}
+
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	isManagerApplicant := len(m.ManagedDepartments) > 0
+	initialStatus := "pending_manager"
+	if isManagerApplicant {
+		// Jika manager yang mengajukan WFA, maka approval langsung di dashboard HR
+		initialStatus = "pending_hr"
+	}
+
+	reqPayload := map[string]any{
+		"company_id":           m.CompanyID,
+		"member_id":            m.MemberID,
+		"user_id":              user.ID,
+		"date":                 input.Date,
+		"reason":               input.Reason,
+		"is_manager_applicant": isManagerApplicant,
+		"status":               initialStatus,
+		"created_at":           now,
+		"updated_at":           now,
+	}
+
+	var createdReq []map[string]any
+	if err := admin.Post(ctx.Context(), "/wfa_requests", "", reqPayload, &createdReq); err != nil {
+		return err
+	}
+	if len(createdReq) == 0 {
+		return fiber.NewError(http.StatusInternalServerError, "Gagal menyimpan permohonan WFA.")
+	}
+	reqData := createdReq[0]
+	requestID, _ := reqData["id"].(string)
+
+	// Simpan card-card task awal
+	tasksPayload := make([]map[string]any, len(input.Tasks))
+	for i, t := range input.Tasks {
+		tasksPayload[i] = map[string]any{
+			"wfa_request_id":         requestID,
+			"title":                  strings.TrimSpace(t.Title),
+			"description":            strings.TrimSpace(t.Description),
+			"added_by_role":          "employee",
+			"is_approved_by_manager": isManagerApplicant, // Manager yang buat langsung auto-acc
+			"status":                 "todo",
+			"sort_order":             i,
+			"created_at":             now,
+			"updated_at":             now,
+		}
+	}
+
+	var createdTasks []map[string]any
+	if err := admin.Post(ctx.Context(), "/wfa_tasks", "", tasksPayload, &createdTasks); err != nil {
+		return err
+	}
+	reqData["tasks"] = createdTasks
+
+	msg := "Permohonan WFA berhasil diajukan dan menunggu persetujuan Manager."
+	if isManagerApplicant {
+		msg = "Permohonan WFA Manager berhasil diajukan dan langsung diteruskan ke Dashboard HR."
+	}
+
+	return ctx.Status(http.StatusCreated).JSON(fiber.Map{
+		"message": msg,
+		"data":    reqData,
+	})
+}
+
+func (api *API) GetMyWFARequests(ctx *fiber.Ctx) error {
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	var requests []map[string]any
+	reqPath := "/wfa_requests?user_id=eq." + url.QueryEscape(user.ID) + "&order=created_at.desc"
+	if err := admin.Get(ctx.Context(), reqPath, "", &requests); err != nil {
+		return err
+	}
+	if len(requests) == 0 {
+		return ctx.JSON([]any{})
+	}
+
+	reqIDs := make([]string, len(requests))
+	for i, r := range requests {
+		if id, ok := r["id"].(string); ok {
+			reqIDs[i] = id
+		}
+	}
+
+	// Ambil tasks untuk seluruh request ini
+	var allTasks []map[string]any
+	tasksPath := "/wfa_tasks?wfa_request_id=in.(" + strings.Join(reqIDs, ",") + ")&order=sort_order.asc"
+	_ = admin.Get(ctx.Context(), tasksPath, "", &allTasks)
+
+	taskGroup := make(map[string][]map[string]any)
+	for _, t := range allTasks {
+		if reqID, ok := t["wfa_request_id"].(string); ok {
+			taskGroup[reqID] = append(taskGroup[reqID], t)
+		}
+	}
+
+	for i := range requests {
+		rID, _ := requests[i]["id"].(string)
+		requests[i]["tasks"] = taskGroup[rID]
+		if requests[i]["tasks"] == nil {
+			requests[i]["tasks"] = []any{}
+		}
+	}
+
+	return ctx.JSON(requests)
+}
+
+func (api *API) GetTodayWFARequest(ctx *fiber.Ctx) error {
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	targetDate := strings.TrimSpace(ctx.Query("date"))
+	if targetDate == "" {
+		targetDate = time.Now().Format("2006-01-02")
+	}
+
+	var requests []map[string]any
+	reqPath := "/wfa_requests?user_id=eq." + url.QueryEscape(user.ID) +
+		"&date=eq." + url.QueryEscape(targetDate) +
+		"&status=neq.rejected&order=created_at.desc&limit=1"
+	if err := admin.Get(ctx.Context(), reqPath, "", &requests); err != nil {
+		return err
+	}
+	if len(requests) == 0 {
+		return ctx.JSON(fiber.Map{
+			"has_wfa": false,
+			"data":    nil,
+		})
+	}
+
+	reqData := requests[0]
+	reqID, _ := reqData["id"].(string)
+
+	var tasks []map[string]any
+	tasksPath := "/wfa_tasks?wfa_request_id=eq." + url.QueryEscape(reqID) + "&order=sort_order.asc"
+	_ = admin.Get(ctx.Context(), tasksPath, "", &tasks)
+	reqData["tasks"] = tasks
+
+	return ctx.JSON(fiber.Map{
+		"has_wfa": true,
+		"data":    reqData,
+	})
+}
+
+type updateWFATaskStatusInput struct {
+	Status string `json:"status"` // "todo", "in_progress", "done"
+}
+
+func (api *API) UpdateWFATaskStatus(ctx *fiber.Ctx) error {
+	taskID := ctx.Params("taskId")
+	var input updateWFATaskStatusInput
+	if err := ctx.BodyParser(&input); err != nil || (input.Status != "todo" && input.Status != "in_progress" && input.Status != "done") {
+		return fiber.NewError(http.StatusBadRequest, "Status task harus 'todo', 'in_progress', atau 'done'.")
+	}
+
+	user := middleware.CurrentUser(ctx)
+	_, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	// 1. Ambil task
+	var tasks []map[string]any
+	if err := admin.Get(ctx.Context(), "/wfa_tasks?id=eq."+url.QueryEscape(taskID)+"&limit=1", "", &tasks); err != nil || len(tasks) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Task WFA tidak ditemukan.")
+	}
+	task := tasks[0]
+	requestID, _ := task["wfa_request_id"].(string)
+
+	// 2. Ambil WFA request
+	var reqs []map[string]any
+	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
+	}
+	wfaReq := reqs[0]
+	reqUserID, _ := wfaReq["user_id"].(string)
+	if reqUserID != user.ID {
+		return fiber.NewError(http.StatusForbidden, "Anda hanya dapat memperbarui task WFA milik Anda sendiri.")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	taskPatch := map[string]any{
+		"status":     input.Status,
+		"updated_at": now,
+	}
+	if input.Status == "done" {
+		taskPatch["completed_at"] = now
+	} else {
+		taskPatch["completed_at"] = nil
+	}
+
+	var updatedTask []map[string]any
+	if err := admin.Patch(ctx.Context(), "/wfa_tasks?id=eq."+url.QueryEscape(taskID), "", taskPatch, &updatedTask); err != nil {
+		return err
+	}
+
+	// 3. Periksa apakah SEMUA task di wfa_request_id ini sudah berstatus 'done'
+	var allTasks []map[string]any
+	_ = admin.Get(ctx.Context(), "/wfa_tasks?wfa_request_id=eq."+url.QueryEscape(requestID), "", &allTasks)
+
+	allCompleted := len(allTasks) > 0
+	completedCount := 0
+	for _, t := range allTasks {
+		if t["id"] == taskID {
+			if input.Status == "done" {
+				completedCount++
+			} else {
+				allCompleted = false
+			}
+		} else {
+			if s, ok := t["status"].(string); ok && s == "done" {
+				completedCount++
+			} else {
+				allCompleted = false
+			}
+		}
+	}
+
+	responseMsg := "Status task berhasil diperbarui."
+	if allCompleted {
+		responseMsg = "Semua task telah selesai (Done). Anda dapat mengunggah bukti pengerjaan lalu mengklik tombol 'Selesaikan Task' untuk mengirim laporan ke Manager."
+	}
+
+	return ctx.JSON(fiber.Map{
+		"message":             responseMsg,
+		"task":                firstMap(updatedTask),
+		"all_tasks_completed": allCompleted,
+		"completed_count":     completedCount,
+		"total_tasks":         len(allTasks),
+	})
+}
+
+type uploadTaskProofInput struct {
+	FileBase64  string `json:"file_base64"`
+	FileName    string `json:"file_name"`
+	ContentType string `json:"content_type"`
+}
+
+func (api *API) UploadTaskProof(ctx *fiber.Ctx) error {
+	taskID := ctx.Params("taskId")
+	var input uploadTaskProofInput
+	if err := ctx.BodyParser(&input); err != nil || strings.TrimSpace(input.FileBase64) == "" {
+		return fiber.NewError(http.StatusBadRequest, "File bukti wajib disertakan.")
+	}
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	fileBytes, err := base64.StdEncoding.DecodeString(input.FileBase64)
+	if err != nil || len(fileBytes) == 0 {
+		return fiber.NewError(http.StatusBadRequest, "Format file tidak valid.")
+	}
+
+	ext := ".jpg"
+	contentType := "image/jpeg"
+	if input.ContentType != "" {
+		contentType = input.ContentType
+	}
+	if strings.Contains(contentType, "png") {
+		ext = ".png"
+	} else if strings.Contains(contentType, "pdf") {
+		ext = ".pdf"
+	}
+
+	fileName := fmt.Sprintf("%s_%d%s", taskID, time.Now().Unix(), ext)
+	objectPath := fmt.Sprintf("%s/%s", user.ID, fileName)
+
+	uploadedURL, err := admin.UploadStorage(ctx.Context(), "wfa-proofs", objectPath, contentType, fileBytes)
+	if err != nil {
+		return fmt.Errorf("upload storage error: %w", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_ = admin.Patch(ctx.Context(), "/wfa_tasks?id=eq."+url.QueryEscape(taskID), "", map[string]any{
+		"attachment_url": uploadedURL,
+		"updated_at":     now,
+	}, nil)
+
+	return ctx.JSON(fiber.Map{
+		"message":        "Bukti pengerjaan task berhasil diunggah.",
+		"attachment_url": uploadedURL,
+	})
+}
+
+func (api *API) SubmitWFACompletion(ctx *fiber.Ctx) error {
+	reqID := ctx.Params("id")
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	var reqs []map[string]any
+	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(reqID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
+	}
+	reqData := reqs[0]
+	if reqData["user_id"] != user.ID {
+		return fiber.NewError(http.StatusForbidden, "Akses ditolak.")
+	}
+
+	// Periksa apakah semua task sudah done
+	var tasks []map[string]any
+	_ = admin.Get(ctx.Context(), "/wfa_tasks?wfa_request_id=eq."+url.QueryEscape(reqID), "", &tasks)
+	if len(tasks) == 0 {
+		return fiber.NewError(http.StatusBadRequest, "Belum ada task pada permohonan WFA ini.")
+	}
+
+	hasAttachment := false
+	for _, t := range tasks {
+		if s, ok := t["status"].(string); !ok || s != "done" {
+			return fiber.NewError(http.StatusBadRequest, "Semua task harus diselesaikan (status Done) sebelum mengirim laporan penyelesaian.")
+		}
+		if att, ok := t["attachment_url"].(string); ok && att != "" {
+			hasAttachment = true
+		}
+	}
+
+	if !hasAttachment {
+		return fiber.NewError(http.StatusBadRequest, "Harap unggah setidaknya 1 bukti (foto/dokumen) pada salah satu card task sebelum menyelesaikan.")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_ = admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(reqID), "", map[string]any{
+		"status":     "submitted_for_review",
+		"updated_at": now,
+	}, nil)
+
+	return ctx.JSON(fiber.Map{
+		"message": "Laporan tugas WFA selesai berhasil dikirimkan ke Manager untuk diperiksa dan di-ACC.",
+		"status":  "submitted_for_review",
+	})
+}
+
+type approveCompletionInput struct {
+	Notes string `json:"notes"`
+}
+
+func (api *API) ApproveWFACompletionByManager(ctx *fiber.Ctx) error {
+	reqID := ctx.Params("id")
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	if len(m.ManagedDepartments) == 0 {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager.")
+	}
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	var reqs []map[string]any
+	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(reqID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
+	}
+	wfaReq := reqs[0]
+	applicantUserID, _ := wfaReq["user_id"].(string)
+	reqDate, _ := wfaReq["date"].(string)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	var input approveCompletionInput
+	_ = ctx.BodyParser(&input)
+
+	// CATAT KEHADIRAN SEBAGAI HADIR WFA
+	var existingAtt []map[string]any
+	_ = admin.Get(ctx.Context(), "/attendances?user_id=eq."+url.QueryEscape(applicantUserID)+"&date=eq."+url.QueryEscape(reqDate)+"&limit=1", "", &existingAtt)
+
+	var attID string
+	if len(existingAtt) == 0 {
+		clockInTime, _ := wfaReq["created_at"].(string)
+		if clockInTime == "" {
+			clockInTime = now
+		}
+		var shiftID *string
+		if m.ShiftID != nil && *m.ShiftID != "" {
+			shiftID = m.ShiftID
+		}
+		attPayload := map[string]any{
+			"company_id":         m.CompanyID,
+			"user_id":            applicantUserID,
+			"shift_id":           shiftID,
+			"date":               reqDate,
+			"clock_in_time":      clockInTime,
+			"clock_out_time":     now,
+			"status":             "on_time",
+			"approval_status":    "approved",
+			"attendance_type":    "wfa",
+			"similarity_score":   1.0,
+			"liveness_verified":  true,
+			"created_at":         now,
+		}
+		var createdAtt []map[string]any
+		if err := admin.Post(ctx.Context(), "/attendances", "", attPayload, &createdAtt); err == nil && len(createdAtt) > 0 {
+			if idVal, ok := createdAtt[0]["id"].(string); ok {
+				attID = idVal
+			}
+		}
+	} else {
+		attID, _ = existingAtt[0]["id"].(string)
+		_ = admin.Patch(ctx.Context(), "/attendances?id=eq."+url.QueryEscape(attID), "", map[string]any{
+			"clock_out_time":  now,
+			"attendance_type": "wfa",
+			"approval_status": "approved",
+		}, nil)
+	}
+
+	// Update wfa_requests ke completed
+	updatePayload := map[string]any{
+		"status":            "completed",
+		"manager_id":        m.MemberID,
+		"manager_name":      user.FullName,
+		"manager_notes":     strings.TrimSpace(input.Notes),
+		"manager_action_at": now,
+		"attendance_id":     attID,
+		"updated_at":        now,
+	}
+	_ = admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(reqID), "", updatePayload, nil)
+
+	return ctx.JSON(fiber.Map{
+		"message":       "Penyelesaian WFA disetujui! Karyawan telah resmi dicatat sebagai Masuk Kerja (Hadir WFA).",
+		"attendance_id": attID,
+		"status":        "completed",
+	})
+}
+
+func (api *API) GetManagerPendingWFARequests(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	if len(m.ManagedDepartments) == 0 {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	managedDeptIDs := make([]string, len(m.ManagedDepartments))
+	for i, d := range m.ManagedDepartments {
+		managedDeptIDs[i] = d.ID
+	}
+
+	deptFilter := strings.Join(managedDeptIDs, ",")
+	membersPath := "/company_members?department_id=in.(" + deptFilter + ")&id=neq." + url.QueryEscape(m.MemberID) +
+		"&select=id,user_id,position_title,department_id,profiles(email,full_name),department:departments!company_members_department_id_fkey(name,code)"
+	var members []map[string]any
+	if err := admin.Get(ctx.Context(), membersPath, "", &members); err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		return ctx.JSON([]any{})
+	}
+
+	memberMap := make(map[string]map[string]any)
+	memberIDs := make([]string, 0, len(members))
+	for _, mb := range members {
+		if id, ok := mb["id"].(string); ok {
+			memberIDs = append(memberIDs, id)
+			memberMap[id] = mb
+		}
+	}
+	if len(memberIDs) == 0 {
+		return ctx.JSON([]any{})
+	}
+
+	// Ambil baik permohonan baru (pending_manager) maupun laporan task selesai (submitted_for_review)
+	wfaPath := "/wfa_requests?member_id=in.(" + strings.Join(memberIDs, ",") + ")&status=in.(pending_manager,submitted_for_review)&order=created_at.desc"
+	var requests []map[string]any
+	if err := admin.Get(ctx.Context(), wfaPath, "", &requests); err != nil {
+		return err
+	}
+	if len(requests) == 0 {
+		return ctx.JSON([]any{})
+	}
+
+	reqIDs := make([]string, len(requests))
+	for i := range requests {
+		mID, _ := requests[i]["member_id"].(string)
+		if mb, found := memberMap[mID]; found {
+			requests[i]["member"] = mb
+		}
+		if id, ok := requests[i]["id"].(string); ok {
+			reqIDs[i] = id
+		}
+	}
+
+	// Pasangkan tasks
+	var tasks []map[string]any
+	tasksPath := "/wfa_tasks?wfa_request_id=in.(" + strings.Join(reqIDs, ",") + ")&order=sort_order.asc"
+	_ = admin.Get(ctx.Context(), tasksPath, "", &tasks)
+
+	taskGroup := make(map[string][]map[string]any)
+	for _, t := range tasks {
+		if rID, ok := t["wfa_request_id"].(string); ok {
+			taskGroup[rID] = append(taskGroup[rID], t)
+		}
+	}
+	for i := range requests {
+		rID, _ := requests[i]["id"].(string)
+		requests[i]["tasks"] = taskGroup[rID]
+		if requests[i]["tasks"] == nil {
+			requests[i]["tasks"] = []any{}
+		}
+	}
+
+	return ctx.JSON(requests)
+}
+
+type managerReviewWFAInput struct {
+	Action          string   `json:"action"` // "approve" atau "reject"
+	Notes           string   `json:"notes"`
+	ApprovedTaskIDs []string `json:"approved_task_ids"` // task-task yang di-acc manager
+	NewTasks        []struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	} `json:"new_tasks"` // task tambahan dari manager
+}
+
+func (api *API) ReviewWFAByManager(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	if len(m.ManagedDepartments) == 0 {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
+	}
+	var input managerReviewWFAInput
+	if err := ctx.BodyParser(&input); err != nil || (input.Action != "approve" && input.Action != "reject") {
+		return fiber.NewError(http.StatusBadRequest, "Action harus 'approve' atau 'reject'.")
+	}
+
+	requestID := ctx.Params("id")
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	var reqs []map[string]any
+	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
+	}
+
+	if input.Action == "approve" {
+		// 1. Tandai task-task yang di-acc manager satu per satu
+		if len(input.ApprovedTaskIDs) > 0 {
+			for _, tid := range input.ApprovedTaskIDs {
+				_ = admin.Patch(ctx.Context(), "/wfa_tasks?id=eq."+url.QueryEscape(tid), "", map[string]any{
+					"is_approved_by_manager": true,
+					"updated_at":             now,
+				}, nil)
+			}
+		}
+
+		// 2. Tambahkan task baru jika manajer menambahkan task
+		if len(input.NewTasks) > 0 {
+			newTasksPayload := make([]map[string]any, len(input.NewTasks))
+			for i, nt := range input.NewTasks {
+				newTasksPayload[i] = map[string]any{
+					"wfa_request_id":         requestID,
+					"title":                  strings.TrimSpace(nt.Title),
+					"description":            strings.TrimSpace(nt.Description),
+					"added_by_role":          "manager",
+					"is_approved_by_manager": true,
+					"status":                 "todo",
+					"sort_order":             100 + i,
+					"created_at":             now,
+					"updated_at":             now,
+				}
+			}
+			_ = admin.Post(ctx.Context(), "/wfa_tasks", "", newTasksPayload, nil)
+		}
+
+		// 3. Update status permohonan menjadi pending_hr (dilaporkan dan diteruskan ke Dashboard HR!)
+		updatePayload := map[string]any{
+			"status":            "pending_hr",
+			"manager_id":        m.MemberID,
+			"manager_name":      user.FullName,
+			"manager_notes":     strings.TrimSpace(input.Notes),
+			"manager_action_at": now,
+			"updated_at":        now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+
+		return ctx.JSON(fiber.Map{
+			"message": "Permohonan WFA dan card task berhasil di-ACC oleh Manager dan dilaporkan ke Dashboard HR.",
+			"data":    firstMap(updated),
+		})
+	} else {
+		updatePayload := map[string]any{
+			"status":            "rejected",
+			"manager_id":        m.MemberID,
+			"manager_name":      user.FullName,
+			"manager_notes":     strings.TrimSpace(input.Notes),
+			"manager_action_at": now,
+			"updated_at":        now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+
+		return ctx.JSON(fiber.Map{
+			"message": "Permohonan WFA telah ditolak oleh Manager.",
+			"data":    firstMap(updated),
+		})
+	}
+}
+
+func (api *API) ListCompanyWFARequests(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	statusFilter := ctx.Query("status")
+	wfaPath := "/wfa_requests?company_id=eq." + url.QueryEscape(m.CompanyID)
+	if statusFilter != "" && statusFilter != "all" {
+		wfaPath += "&status=eq." + url.QueryEscape(statusFilter)
+	}
+	wfaPath += "&order=created_at.desc"
+
+	var requests []map[string]any
+	if err := admin.Get(ctx.Context(), wfaPath, "", &requests); err != nil {
+		return err
+	}
+	if len(requests) == 0 {
+		return ctx.JSON(fiber.Map{"data": []any{}})
+	}
+
+	// Ambil mapping company_members
+	membersPath := "/company_members?company_id=eq." + url.QueryEscape(m.CompanyID) +
+		"&select=id,position_title,profiles(email,full_name),department:departments(id,name,code)"
+	var members []map[string]any
+	_ = admin.Get(ctx.Context(), membersPath, "", &members)
+
+	memberMap := make(map[string]map[string]any)
+	for _, mb := range members {
+		if id, ok := mb["id"].(string); ok {
+			memberMap[id] = mb
+		}
+	}
+
+	// Ambil semua task terkait
+	reqIDs := make([]string, len(requests))
+	for i, r := range requests {
+		if id, ok := r["id"].(string); ok {
+			reqIDs[i] = id
+		}
+	}
+	var allTasks []map[string]any
+	tasksPath := "/wfa_tasks?wfa_request_id=in.(" + strings.Join(reqIDs, ",") + ")&order=sort_order.asc"
+	_ = admin.Get(ctx.Context(), tasksPath, "", &allTasks)
+
+	taskGroup := make(map[string][]map[string]any)
+	for _, t := range allTasks {
+		if rID, ok := t["wfa_request_id"].(string); ok {
+			taskGroup[rID] = append(taskGroup[rID], t)
+		}
+	}
+
+	result := make([]map[string]any, len(requests))
+	for i, r := range requests {
+		item := make(map[string]any)
+		for k, v := range r {
+			item[k] = v
+		}
+
+		item["member_name"] = ""
+		item["member_email"] = ""
+		item["department_name"] = ""
+		item["position_title"] = ""
+
+		mID, _ := r["member_id"].(string)
+		if mb, found := memberMap[mID]; found {
+			item["member"] = mb
+			if pos, ok := mb["position_title"].(string); ok {
+				item["position_title"] = pos
+			}
+			if prof, ok := mb["profiles"].(map[string]any); ok {
+				if fn, ok := prof["full_name"].(string); ok && fn != "" {
+					item["member_name"] = fn
+				}
+				if em, ok := prof["email"].(string); ok {
+					item["member_email"] = em
+					if item["member_name"] == "" {
+						item["member_name"] = em
+					}
+				}
+			}
+			if dept, ok := mb["department"].(map[string]any); ok {
+				if dn, ok := dept["name"].(string); ok {
+					item["department_name"] = dn
+				}
+			}
+		}
+
+		rID, _ := r["id"].(string)
+		item["tasks"] = taskGroup[rID]
+		if item["tasks"] == nil {
+			item["tasks"] = []any{}
+		}
+
+		result[i] = item
+	}
+
+	return ctx.JSON(fiber.Map{
+		"data": result,
+	})
+}
+
+type hrReviewWFAInput struct {
+	Action string `json:"action"` // "approve" atau "reject"
+	Notes  string `json:"notes"`
+}
+
+func (api *API) ReviewWFAByHR(ctx *fiber.Ctx) error {
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+	var input hrReviewWFAInput
+	if err := ctx.BodyParser(&input); err != nil || (input.Action != "approve" && input.Action != "reject") {
+		return fiber.NewError(http.StatusBadRequest, "Action harus 'approve' atau 'reject'.")
+	}
+
+	requestID := ctx.Params("id")
+	user := middleware.CurrentUser(ctx)
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	var reqs []map[string]any
+	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
+		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
+	}
+
+	newStatus := "approved"
+	msg := "Permohonan WFA telah disetujui (ACC) oleh HR. Karyawan dapat melaksanakan WFA."
+	if input.Action == "reject" {
+		newStatus = "rejected"
+		msg = "Permohonan WFA telah ditolak oleh HR."
+	}
+
+	updatePayload := map[string]any{
+		"status":       newStatus,
+		"hr_id":        m.MemberID,
+		"hr_name":      user.FullName,
+		"hr_notes":     strings.TrimSpace(input.Notes),
+		"hr_action_at": now,
+		"updated_at":   now,
+	}
+
+	var updated []map[string]any
+	if err := admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID), "", updatePayload, &updated); err != nil {
+		return err
+	}
+
+	return ctx.JSON(fiber.Map{
+		"message": msg,
+		"data":    firstMap(updated),
+	})
+}
+
 
 func ErrorHandler(ctx *fiber.Ctx, err error) error {
 	status := fiber.StatusInternalServerError
