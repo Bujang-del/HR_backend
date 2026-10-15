@@ -2585,6 +2585,13 @@ func (api *API) UpdateWFATaskStatus(ctx *fiber.Ctx) error {
 		return fiber.NewError(http.StatusForbidden, "Anda hanya dapat memperbarui task WFA milik Anda sendiri.")
 	}
 
+	if input.Status == "done" {
+		attachment, _ := task["attachment_url"].(string)
+		if strings.TrimSpace(attachment) == "" {
+			return fiber.NewError(http.StatusBadRequest, "Bukti pengerjaan (foto/dokumen) wajib diunggah sebelum menyelesaikan task ini.")
+		}
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
 	taskPatch := map[string]any{
 		"status":     input.Status,
@@ -2715,18 +2722,14 @@ func (api *API) SubmitWFACompletion(ctx *fiber.Ctx) error {
 		return fiber.NewError(http.StatusBadRequest, "Belum ada task pada permohonan WFA ini.")
 	}
 
-	hasAttachment := false
 	for _, t := range tasks {
 		if s, ok := t["status"].(string); !ok || s != "done" {
 			return fiber.NewError(http.StatusBadRequest, "Semua task harus diselesaikan (status Done) sebelum mengirim laporan penyelesaian.")
 		}
-		if att, ok := t["attachment_url"].(string); ok && att != "" {
-			hasAttachment = true
+		att, _ := t["attachment_url"].(string)
+		if strings.TrimSpace(att) == "" {
+			return fiber.NewError(http.StatusBadRequest, "Setiap task wajib memiliki bukti pengerjaan (foto/dokumen) sebelum laporan dapat dikirim.")
 		}
-	}
-
-	if !hasAttachment {
-		return fiber.NewError(http.StatusBadRequest, "Harap unggah setidaknya 1 bukti (foto/dokumen) pada salah satu card task sebelum menyelesaikan.")
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -2751,8 +2754,9 @@ func (api *API) ApproveWFACompletionByManager(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if len(m.ManagedDepartments) == 0 {
-		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager.")
+	isManagerOrAdmin := len(m.ManagedDepartments) > 0 || m.Role == "owner" || m.Role == "admin" || m.Role == "manager"
+	if !isManagerOrAdmin {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager atau Admin.")
 	}
 	user := middleware.CurrentUser(ctx)
 	admin := api.SupabaseAdmin
@@ -2839,28 +2843,38 @@ func (api *API) GetManagerPendingWFARequests(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if len(m.ManagedDepartments) == 0 {
-		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
+	isManagerOrAdmin := len(m.ManagedDepartments) > 0 || m.Role == "owner" || m.Role == "admin" || m.Role == "manager"
+	if !isManagerOrAdmin {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager atau Admin Departemen.")
 	}
 	admin := api.SupabaseAdmin
 	if admin == nil {
 		admin = api.Supabase
 	}
 
-	managedDeptIDs := make([]string, len(m.ManagedDepartments))
-	for i, d := range m.ManagedDepartments {
-		managedDeptIDs[i] = d.ID
+	var membersPath string
+	if len(m.ManagedDepartments) > 0 {
+		managedDeptIDs := make([]string, len(m.ManagedDepartments))
+		for i, d := range m.ManagedDepartments {
+			managedDeptIDs[i] = d.ID
+		}
+		deptFilter := strings.Join(managedDeptIDs, ",")
+		membersPath = "/company_members?department_id=in.(" + deptFilter + ")&company_id=eq." + url.QueryEscape(m.CompanyID) +
+			"&select=id,user_id,position_title,department_id,profiles(email,full_name),department:departments(name,code)"
+	} else if m.DepartmentID != nil && *m.DepartmentID != "" {
+		membersPath = "/company_members?department_id=eq." + url.QueryEscape(*m.DepartmentID) + "&company_id=eq." + url.QueryEscape(m.CompanyID) +
+			"&select=id,user_id,position_title,department_id,profiles(email,full_name),department:departments(name,code)"
+	} else {
+		membersPath = "/company_members?company_id=eq." + url.QueryEscape(m.CompanyID) +
+			"&select=id,user_id,position_title,department_id,profiles(email,full_name),department:departments(name,code)"
 	}
 
-	deptFilter := strings.Join(managedDeptIDs, ",")
-	membersPath := "/company_members?department_id=in.(" + deptFilter + ")&id=neq." + url.QueryEscape(m.MemberID) +
-		"&select=id,user_id,position_title,department_id,profiles(email,full_name),department:departments!company_members_department_id_fkey(name,code)"
 	var members []map[string]any
 	if err := admin.Get(ctx.Context(), membersPath, "", &members); err != nil {
-		return err
-	}
-	if len(members) == 0 {
-		return ctx.JSON([]any{})
+		// Fallback query tanpa relasi jika ada issue schema cache PostgREST
+		fallbackMembersPath := "/company_members?company_id=eq." + url.QueryEscape(m.CompanyID) +
+			"&select=id,user_id,position_title,department_id,profiles(email,full_name)"
+		_ = admin.Get(ctx.Context(), fallbackMembersPath, "", &members)
 	}
 
 	memberMap := make(map[string]map[string]any)
@@ -2871,18 +2885,41 @@ func (api *API) GetManagerPendingWFARequests(ctx *fiber.Ctx) error {
 			memberMap[id] = mb
 		}
 	}
-	if len(memberIDs) == 0 {
-		return ctx.JSON([]any{})
+
+	// Ambil permohonan WFA: jika owner/admin atau jika filter departemen kosong, ambil seluruh permohonan WFA perusahaan
+	var wfaPath string
+	if (m.Role == "owner" || m.Role == "admin") || len(memberIDs) == 0 {
+		wfaPath = "/wfa_requests?company_id=eq." + url.QueryEscape(m.CompanyID) + "&order=created_at.desc"
+	} else {
+		wfaPath = "/wfa_requests?member_id=in.(" + strings.Join(memberIDs, ",") + ")&order=created_at.desc"
 	}
 
-	// Ambil baik permohonan baru (pending_manager) maupun laporan task selesai (submitted_for_review)
-	wfaPath := "/wfa_requests?member_id=in.(" + strings.Join(memberIDs, ",") + ")&status=in.(pending_manager,submitted_for_review)&order=created_at.desc"
 	var requests []map[string]any
 	if err := admin.Get(ctx.Context(), wfaPath, "", &requests); err != nil {
 		return err
 	}
 	if len(requests) == 0 {
 		return ctx.JSON([]any{})
+	}
+
+	// Backfill member info jika ada request dari member yang belum ada di memberMap
+	missingMemberIDs := make([]string, 0)
+	for i := range requests {
+		mID, _ := requests[i]["member_id"].(string)
+		if _, found := memberMap[mID]; !found && mID != "" {
+			missingMemberIDs = append(missingMemberIDs, mID)
+		}
+	}
+	if len(missingMemberIDs) > 0 {
+		var extraMembers []map[string]any
+		extraPath := "/company_members?id=in.(" + strings.Join(missingMemberIDs, ",") + ")&select=id,user_id,position_title,department_id,profiles(email,full_name)"
+		if err := admin.Get(ctx.Context(), extraPath, "", &extraMembers); err == nil {
+			for _, emb := range extraMembers {
+				if id, ok := emb["id"].(string); ok {
+					memberMap[id] = emb
+				}
+			}
+		}
 	}
 
 	reqIDs := make([]string, len(requests))
@@ -2896,7 +2933,7 @@ func (api *API) GetManagerPendingWFARequests(ctx *fiber.Ctx) error {
 		}
 	}
 
-	// Pasangkan tasks
+	// Pasangkan tasks aktual
 	var tasks []map[string]any
 	tasksPath := "/wfa_tasks?wfa_request_id=in.(" + strings.Join(reqIDs, ",") + ")&order=sort_order.asc"
 	_ = admin.Get(ctx.Context(), tasksPath, "", &tasks)
@@ -2933,8 +2970,9 @@ func (api *API) ReviewWFAByManager(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if len(m.ManagedDepartments) == 0 {
-		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
+	isManagerOrAdmin := len(m.ManagedDepartments) > 0 || m.Role == "owner" || m.Role == "admin" || m.Role == "manager"
+	if !isManagerOrAdmin {
+		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager atau Admin Departemen.")
 	}
 	var input managerReviewWFAInput
 	if err := ctx.BodyParser(&input); err != nil || (input.Action != "approve" && input.Action != "reject") {
