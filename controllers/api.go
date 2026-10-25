@@ -1,4 +1,4 @@
-package controllers
+﻿package controllers
 
 import (
 	"encoding/base64"
@@ -21,6 +21,7 @@ type API struct {
 	SupabaseAdmin     *services.SupabaseClient
 	Mailer            *services.SMTPMailer
 	InviteRedirectURL string
+	Gemini            *services.GeminiService
 }
 
 type departmentSummary struct {
@@ -188,8 +189,8 @@ func (api *API) Me(ctx *fiber.Ctx) error {
 	}
 
 	// Hitung display_position = position_title + " " + department_code
-	// Contoh: "Manager" + " " + "SDM" → "Manager SDM"
-	//         "Staff"   + " " + "FI"  → "Staff FI"
+	// Contoh: "Manager" + " " + "SDM" â†’ "Manager SDM"
+	//         "Staff"   + " " + "FI"  â†’ "Staff FI"
 	displayPosition := ""
 	if m.PositionTitle != nil {
 		displayPosition = strings.TrimSpace(*m.PositionTitle)
@@ -902,7 +903,7 @@ func (api *API) currentMembership(ctx *fiber.Ctx) (membership, error) {
 	user := middleware.CurrentUser(ctx)
 	var memberships []membership
 	// Gunakan nama FK eksplisit untuk menghindari ambiguitas PostgREST (error 300).
-	// managed_departments: join balik dari departments.manager_id → company_members.id
+	// managed_departments: join balik dari departments.manager_id â†’ company_members.id
 	// untuk mendeteksi apakah user ini adalah manager suatu departemen.
 	path := "/company_members?user_id=eq." + url.QueryEscape(user.ID) +
 		"&select=id,company_id,role,position_title,department_id,shift_id," +
@@ -1382,6 +1383,66 @@ func (api *API) EnrollMyFace(ctx *fiber.Ctx) error {
 	})
 }
 
+func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhotoBase64 string) (float64, bool, error) {
+	if api.Gemini == nil {
+		return 1.0, true, nil
+	}
+	if strings.TrimSpace(incomingPhotoBase64) == "" {
+		return 0, false, fiber.NewError(http.StatusBadRequest, "Foto selfie presensi wajib disertakan untuk verifikasi wajah.")
+	}
+
+	incomingBytes, err := base64.StdEncoding.DecodeString(incomingPhotoBase64)
+	if err != nil || len(incomingBytes) == 0 {
+		return 0, false, fiber.NewError(http.StatusBadRequest, "Format foto selfie presensi tidak valid.")
+	}
+
+	admin := api.SupabaseAdmin
+	if admin == nil {
+		admin = api.Supabase
+	}
+
+	// 1. Ambil data master wajah terdaftar
+	pathBio := "/user_biometrics?user_id=eq." + url.QueryEscape(userID) + "&limit=1"
+	var biometrics []map[string]any
+	if err := admin.Get(ctx.Context(), pathBio, "", &biometrics); err != nil || len(biometrics) == 0 {
+		return 0, false, fiber.NewError(http.StatusBadRequest, "Wajah Anda belum terdaftar di sistem. Silakan lakukan pendaftaran wajah terlebih dahulu pada menu Profil/Biometrik.")
+	}
+
+	// 2. Unduh foto master wajah terdaftar
+	var regBytes []byte
+	regBytes, _ = admin.DownloadStorage(ctx.Context(), "biometric-faces", fmt.Sprintf("%s/master.jpg", userID))
+	if len(regBytes) == 0 {
+		if photoURL, ok := biometrics[0]["face_photo_url"].(string); ok && photoURL != "" {
+			regBytes, _ = admin.DownloadURL(ctx.Context(), photoURL)
+		}
+	}
+
+	if len(regBytes) == 0 {
+		return 0, false, fiber.NewError(http.StatusBadRequest, "Foto master wajah terdaftar tidak ditemukan di storage. Silakan daftarkan ulang wajah Anda.")
+	}
+
+	// 3. Verifikasi biometrik dengan model AI Gemini
+	result, err := api.Gemini.VerifyFace(ctx.Context(), regBytes, incomingBytes)
+	if err != nil {
+		fmt.Printf("[Gemini Face Verify Error] %v\n", err)
+		return 0, false, fiber.NewError(http.StatusInternalServerError, fmt.Sprintf("Gagal memproses verifikasi AI: %v", err))
+	}
+
+	if !result.IsMatch || result.ConfidenceScore < 0.65 {
+		reason := result.Reason
+		if reason == "" {
+			reason = "Wajah tidak cocok dengan foto profil terdaftar."
+		}
+		return result.ConfidenceScore, result.IsLivePerson, fiber.NewError(http.StatusUnauthorized, fmt.Sprintf("Autentikasi wajah gagal (Skor: %.1f%%): %s", result.ConfidenceScore*100, reason))
+	}
+
+	if !result.IsLivePerson {
+		return result.ConfidenceScore, false, fiber.NewError(http.StatusUnauthorized, "Autentikasi gagal: Foto harus berupa wajah orang asli secara langsung di depan kamera (Anti-Spoofing).")
+	}
+
+	return result.ConfidenceScore, result.IsLivePerson, nil
+}
+
 func (api *API) ClockIn(ctx *fiber.Ctx) error {
 	user := middleware.CurrentUser(ctx)
 	m, err := api.currentMembership(ctx)
@@ -1397,6 +1458,14 @@ func (api *API) ClockIn(ctx *fiber.Ctx) error {
 	if err := ctx.BodyParser(&body); err != nil {
 		return fiber.NewError(http.StatusBadRequest, "Payload clock-in tidak valid.")
 	}
+
+	// Verifikasi wajah biometrik dengan Gemini AI
+	simScore, liveVerified, err := api.verifyFaceWithGemini(ctx, user.ID, body.PhotoBase64)
+	if err != nil {
+		return err
+	}
+	body.SimilarityScore = simScore
+	body.LivenessVerified = liveVerified
 
 	now := time.Now()
 	dateStr := now.Format("2006-01-02")
@@ -1526,6 +1595,16 @@ func (api *API) ClockOut(ctx *fiber.Ctx) error {
 		PhotoBase64      string  `json:"photo_base64"`
 	}
 	_ = ctx.BodyParser(&body)
+
+	// Verifikasi wajah biometrik dengan Gemini AI jika ada foto
+	if strings.TrimSpace(body.PhotoBase64) != "" {
+		simScore, liveVerified, err := api.verifyFaceWithGemini(ctx, user.ID, body.PhotoBase64)
+		if err != nil {
+			return err
+		}
+		body.SimilarityScore = simScore
+		body.LivenessVerified = liveVerified
+	}
 
 	photoURL := ""
 	if body.PhotoBase64 != "" {

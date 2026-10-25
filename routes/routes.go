@@ -1,4 +1,4 @@
-package routes
+﻿package routes
 
 import (
 	"strings"
@@ -12,7 +12,7 @@ import (
 )
 
 func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mailer *services.SMTPMailer, inviteRedirectURL, corsOrigins string) {
-	api := &controllers.API{Supabase: client, SupabaseAdmin: adminClient, Mailer: mailer, InviteRedirectURL: inviteRedirectURL}
+	api := &controllers.API{Supabase: client, SupabaseAdmin: adminClient, Mailer: mailer, InviteRedirectURL: inviteRedirectURL, Gemini: services.NewGeminiService()}
 	app.Use(cors.New(cors.Config{AllowOrigins: strings.TrimSpace(corsOrigins), AllowHeaders: "Origin, Content-Type, Accept, Authorization"}))
 	if inviteRedirectURL != "" {
 		app.Get("/", func(ctx *fiber.Ctx) error {

@@ -191,3 +191,59 @@ func (client *SupabaseClient) UploadStorage(ctx context.Context, bucket, objectP
 }
 
 
+
+func (client *SupabaseClient) DownloadStorage(ctx context.Context, bucket, objectPath string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/storage/v1/object/authenticated/%s/%s", client.baseURL, bucket, objectPath), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("apikey", client.apiKey)
+	req.Header.Set("Authorization", "Bearer "+client.apiKey)
+
+	resp, err := client.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		pubReq, pubErr := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/storage/v1/object/public/%s/%s", client.baseURL, bucket, objectPath), nil)
+		if pubErr == nil {
+			pubReq.Header.Set("apikey", client.apiKey)
+			pubResp, pubDoErr := client.httpClient.Do(pubReq)
+			if pubDoErr == nil && pubResp.StatusCode == http.StatusOK {
+				defer pubResp.Body.Close()
+				return io.ReadAll(pubResp.Body)
+			}
+			if pubResp != nil {
+				pubResp.Body.Close()
+			}
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, &HTTPError{Status: resp.StatusCode, Message: string(respBody)}
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func (client *SupabaseClient) DownloadURL(ctx context.Context, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("apikey", client.apiKey)
+	req.Header.Set("Authorization", "Bearer "+client.apiKey)
+
+	resp, err := client.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, &HTTPError{Status: resp.StatusCode, Message: string(respBody)}
+	}
+
+	return io.ReadAll(resp.Body)
+}
