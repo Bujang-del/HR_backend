@@ -1,4 +1,4 @@
-﻿package services
+package services
 
 import (
 	"bytes"
@@ -6,6 +6,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	_ "image/gif"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"net/http"
 	"os"
@@ -35,9 +40,71 @@ func NewGeminiService() *GeminiService {
 	return &GeminiService{
 		apiKey: apiKey,
 		httpClient: &http.Client{
-			Timeout: 25 * time.Second,
+			Timeout: 30 * time.Second,
 		},
 	}
+}
+
+// optimizeImage memperkecil dimensi dan mengompresi gambar JPEG untuk efisiensi payload dan menghindari timeout pada Gemini API
+func optimizeImage(input []byte, maxDim int, quality int) []byte {
+	if len(input) == 0 {
+		return input
+	}
+
+	img, _, err := image.Decode(bytes.NewReader(input))
+	if err != nil {
+		// Jika decode gagal atau format non-standar, gunakan bytes asli
+		return input
+	}
+
+	bounds := img.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+
+	// Jika dimensi sudah kecil dan ukuran file < 250KB, langsung pakai
+	if w <= maxDim && h <= maxDim && len(input) <= 250*1024 {
+		return input
+	}
+
+	scale := 1.0
+	if w > maxDim || h > maxDim {
+		if w > h {
+			scale = float64(maxDim) / float64(w)
+		} else {
+			scale = float64(maxDim) / float64(h)
+		}
+	}
+
+	newW := int(float64(w) * scale)
+	newH := int(float64(h) * scale)
+	if newW < 1 {
+		newW = 1
+	}
+	if newH < 1 {
+		newH = 1
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	for y := 0; y < newH; y++ {
+		srcY := bounds.Min.Y + int(float64(y)/scale)
+		for x := 0; x < newW; x++ {
+			srcX := bounds.Min.X + int(float64(x)/scale)
+			r, g, b, a := img.At(srcX, srcY).RGBA()
+			dst.SetRGBA(x, y, color.RGBA{
+				R: uint8(r >> 8),
+				G: uint8(g >> 8),
+				B: uint8(b >> 8),
+				A: uint8(a >> 8),
+			})
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
+		return input
+	}
+
+	return buf.Bytes()
 }
 
 func (g *GeminiService) VerifyFace(ctx context.Context, registeredPhotoBytes, attendancePhotoBytes []byte) (*FaceVerificationResult, error) {
@@ -45,8 +112,12 @@ func (g *GeminiService) VerifyFace(ctx context.Context, registeredPhotoBytes, at
 		return nil, fmt.Errorf("GEMINI_API_KEY belum dikonfigurasi di environment (.env)")
 	}
 
-	regBase64 := base64.StdEncoding.EncodeToString(registeredPhotoBytes)
-	attBase64 := base64.StdEncoding.EncodeToString(attendancePhotoBytes)
+	// Kompresi dan optimalkan gambar agar payload ringan (< 100 KB) dan respon Gemini instan
+	regOpt := optimizeImage(registeredPhotoBytes, 640, 75)
+	attOpt := optimizeImage(attendancePhotoBytes, 640, 75)
+
+	regBase64 := base64.StdEncoding.EncodeToString(regOpt)
+	attBase64 := base64.StdEncoding.EncodeToString(attOpt)
 
 	prompt := `Anda adalah model AI pakar biometrik untuk verifikasi wajah sistem presensi kehadiran.
 Tugas Anda:
@@ -68,7 +139,8 @@ Keluarkan HANYA JSON valid (tanpa markdown ataupun petik tambahan) dengan format
   "reason": "Penjelasan singkat dalam bahasa Indonesia"
 }`
 
-	modelsToTry := []string{"gemini-3.5-flash-lite", "gemini-3.8-flash"}
+	// Gunakan model tercepat dengan latensi rendah (gemini-3.5-flash-lite ~2s, fallback gemini-3.5-flash)
+	modelsToTry := []string{"gemini-3.5-flash-lite", "gemini-3.5-flash"}
 
 	var lastErr error
 	for _, model := range modelsToTry {
@@ -105,20 +177,25 @@ Keluarkan HANYA JSON valid (tanpa markdown ataupun petik tambahan) dengan format
 			return nil, err
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(jsonBytes))
+		// Batasi per request maksimal 15 detik agar respon cepat dan tidak hang
+		callCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		req, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(jsonBytes))
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := g.httpClient.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = err
 			continue
 		}
 
 		bodyBytes, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		cancel()
 
 		if err != nil {
 			lastErr = err
