@@ -1315,15 +1315,39 @@ func (api *API) GetMyBiometricFace(ctx *fiber.Ctx) error {
 	}
 	if len(records) == 0 {
 		return ctx.JSON(fiber.Map{
-			"is_enrolled":    false,
-			"face_photo_url": "",
-			"face_embedding": []any{},
+			"is_enrolled":     false,
+			"approval_status": "none",
+			"is_approved":     false,
+			"face_photo_url":  "",
+			"face_embedding":  []any{},
 		})
 	}
+
+	approvalStatus := "approved"
+	isApproved := true
+	rejectionNotes := ""
+
+	checkReq := fmt.Sprintf("/face_reset_requests?user_id=eq.%s&order=created_at.desc&limit=1", url.QueryEscape(user.ID))
+	var lastReq []map[string]any
+	if err := admin.Get(ctx.Context(), checkReq, "", &lastReq); err == nil && len(lastReq) > 0 {
+		st, _ := lastReq[0]["status"].(string)
+		if st == "pending" {
+			approvalStatus = "pending"
+			isApproved = false
+		} else if st == "rejected" {
+			approvalStatus = "rejected"
+			isApproved = false
+			rejectionNotes, _ = lastReq[0]["rejection_notes"].(string)
+		}
+	}
+
 	return ctx.JSON(fiber.Map{
-		"is_enrolled":    true,
-		"face_photo_url": records[0]["face_photo_url"],
-		"face_embedding": records[0]["face_embedding"],
+		"is_enrolled":     true,
+		"approval_status": approvalStatus,
+		"is_approved":     isApproved,
+		"rejection_notes": rejectionNotes,
+		"face_photo_url":  records[0]["face_photo_url"],
+		"face_embedding":  records[0]["face_embedding"],
 	})
 }
 
@@ -1381,10 +1405,32 @@ func (api *API) EnrollMyFace(ctx *fiber.Ctx) error {
 		}
 	}
 
+	// Ajukan permohonan pendaftaran wajah ke HR agar diverifikasi
+	m, err := api.currentMembership(ctx)
+	companyID := ""
+	if err == nil {
+		companyID = m.CompanyID
+	}
+	checkPending := fmt.Sprintf("/face_reset_requests?user_id=eq.%s&status=eq.pending&limit=1", url.QueryEscape(user.ID))
+	var pendingRequests []map[string]any
+	_ = admin.Get(ctx.Context(), checkPending, "", &pendingRequests)
+	if len(pendingRequests) == 0 {
+		reqPayload := map[string]any{
+			"company_id": companyID,
+			"user_id":    user.ID,
+			"reason":     "Pendaftaran wajah biometrik baru (Memerlukan verifikasi & persetujuan HR)",
+			"status":     "pending",
+			"created_at": time.Now().UTC().Format(time.RFC3339),
+		}
+		_ = admin.Post(ctx.Context(), "/face_reset_requests", "", reqPayload, nil)
+	}
+
 	return ctx.JSON(fiber.Map{
-		"message":        "Wajah biometrik berhasil didaftarkan.",
-		"is_enrolled":    true,
-		"face_photo_url": photoURL,
+		"message":         "Foto wajah berhasil didaftarkan dan dikirim ke HR untuk diverifikasi.",
+		"is_enrolled":     true,
+		"approval_status": "pending",
+		"is_approved":     false,
+		"face_photo_url":  photoURL,
 	})
 }
 
@@ -1411,6 +1457,23 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 	var biometrics []map[string]any
 	if err := admin.Get(ctx.Context(), pathBio, "", &biometrics); err != nil || len(biometrics) == 0 {
 		return 0, false, fiber.NewError(http.StatusBadRequest, "Wajah Anda belum terdaftar di sistem. Silakan lakukan pendaftaran wajah terlebih dahulu pada menu Profil/Biometrik.")
+	}
+
+	// 1b. Pastikan pendaftaran wajah sudah disetujui HR
+	checkApproval := fmt.Sprintf("/face_reset_requests?user_id=eq.%s&order=created_at.desc&limit=1", url.QueryEscape(userID))
+	var reqs []map[string]any
+	if err := admin.Get(ctx.Context(), checkApproval, "", &reqs); err == nil && len(reqs) > 0 {
+		st, _ := reqs[0]["status"].(string)
+		if st == "pending" {
+			return 0, false, fiber.NewError(http.StatusForbidden, "Pendaftaran wajah Anda masih menunggu persetujuan HR. Presensi baru dapat dilakukan setelah disetujui.")
+		}
+		if st == "rejected" {
+			notes, _ := reqs[0]["rejection_notes"].(string)
+			if notes == "" {
+				notes = "Silakan daftarkan ulang foto wajah Anda."
+			}
+			return 0, false, fiber.NewError(http.StatusForbidden, fmt.Sprintf("Pendaftaran wajah Anda ditolak oleh HR: %s", notes))
+		}
 	}
 
 	// 2. Unduh foto master wajah terdaftar
