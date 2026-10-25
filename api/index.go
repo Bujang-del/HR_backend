@@ -40,6 +40,12 @@ func initialize() {
 
 // Handler is the entrypoint for Vercel Serverless Functions
 func Handler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("debug") == "1" {
+		w.Header().Set("Content-Type", "application/json")
+		log.Printf("[DEBUG] URL.Path=%s, RequestURI=%s, Matched=%s", r.URL.Path, r.RequestURI, r.Header.Get("x-matched-path"))
+		w.Write([]byte({"path":" + r.URL.Path + ","uri":" + r.RequestURI + ","matched":" + r.Header.Get("x-matched-path") + "}))
+		return
+	}
 	initOnce.Do(initialize)
 	if fiberHandler != nil {
 		fiberHandler(w, r)
