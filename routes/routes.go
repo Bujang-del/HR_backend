@@ -16,9 +16,11 @@ func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mail
 	app.Use(cors.New(cors.Config{AllowOrigins: strings.TrimSpace(corsOrigins), AllowHeaders: "Origin, Content-Type, Accept, Authorization"}))
 	app.Get("/api/index.go", func(ctx *fiber.Ctx) error {
 		return ctx.JSON(fiber.Map{
-			"status":  "ok",
-			"message": "HR Gateway Backend is running",
-			"health":  "/api/v1/health",
+			"status":        "ok",
+			"fiber_path":    ctx.Path(),
+			"original_url":  ctx.OriginalURL(),
+			"all_headers":   ctx.GetReqHeaders(),
+			"queries":       ctx.Queries(),
 		})
 	})
 	app.Get("/", func(ctx *fiber.Ctx) error {
