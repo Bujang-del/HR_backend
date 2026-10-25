@@ -3,7 +3,6 @@ package handler
 import (
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 
 	"hr-gateway-backend/config"
@@ -43,42 +42,12 @@ func initialize() {
 func Handler(w http.ResponseWriter, r *http.Request) {
 	initOnce.Do(initialize)
 
-	targetPath := ""
-
-	// 1. Cek query param jika diteruskan oleh vercel rewrite (?__route_path=...)
-	if qPath := r.URL.Query().Get("__route_path"); qPath != "" {
-		targetPath = qPath
-	}
-
-	// 2. Cek header Vercel X-Matched-Path
-	if targetPath == "" {
-		if matched := r.Header.Get("X-Matched-Path"); matched != "" && matched != "/api" {
-			targetPath = matched
-		}
-	}
-
-	// 3. Cek header X-Forwarded-Uri
-	if targetPath == "" {
-		if fwd := r.Header.Get("X-Forwarded-Uri"); fwd != "" {
-			parts := strings.Split(fwd, "?")
-			targetPath = parts[0]
-		}
-	}
-
-	// 4. Fallback ke URL.Path atau RequestURI
-	if targetPath == "" && r.URL.Path != "" && r.URL.Path != "/api" {
-		targetPath = r.URL.Path
-	}
-
-	if targetPath != "" {
-		if !strings.HasPrefix(targetPath, "/") {
-			targetPath = "/" + targetPath
-		}
-		for strings.HasPrefix(targetPath, "//") {
-			targetPath = targetPath[1:]
-		}
-		r.URL.Path = targetPath
-		r.RequestURI = targetPath
+	// Ensure Fiber parses the exact incoming URL
+	if matched := r.Header.Get("X-Matched-Path"); matched != "" && matched != "/api" && matched != "/api/index.go" {
+		r.URL.Path = matched
+		r.RequestURI = matched
+	} else if r.URL != nil {
+		r.RequestURI = r.URL.String()
 	}
 
 	if fiberHandler != nil {
