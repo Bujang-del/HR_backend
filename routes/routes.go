@@ -14,11 +14,24 @@ import (
 func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mailer *services.SMTPMailer, inviteRedirectURL, corsOrigins string) {
 	api := &controllers.API{Supabase: client, SupabaseAdmin: adminClient, Mailer: mailer, InviteRedirectURL: inviteRedirectURL, Gemini: services.NewGeminiService()}
 	app.Use(cors.New(cors.Config{AllowOrigins: strings.TrimSpace(corsOrigins), AllowHeaders: "Origin, Content-Type, Accept, Authorization"}))
-	if inviteRedirectURL != "" {
-		app.Get("/", func(ctx *fiber.Ctx) error {
+	app.Get("/", func(ctx *fiber.Ctx) error {
+		if inviteRedirectURL != "" {
 			return ctx.Redirect(inviteRedirectURL, fiber.StatusFound)
+		}
+		return ctx.JSON(fiber.Map{
+			"status":  "ok",
+			"message": "HR Gateway Backend is running",
+			"health":  "/api/v1/health",
 		})
-	}
+	})
+	app.Get("/api", func(ctx *fiber.Ctx) error {
+		return ctx.JSON(fiber.Map{
+			"status":  "ok",
+			"message": "HR Gateway Backend API",
+			"health":  "/api/v1/health",
+		})
+	})
+	app.Get("/health", api.Health)
 	app.Get("/api/v1/health", api.Health)
 	app.Post("/api/v1/auth/login", api.Login)
 	protected := app.Group("/api/v1", middleware.RequireAuth(client))
