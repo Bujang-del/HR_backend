@@ -139,8 +139,8 @@ Keluarkan HANYA JSON valid (tanpa markdown ataupun petik tambahan) dengan format
   "reason": "Penjelasan singkat dalam bahasa Indonesia"
 }`
 
-	// Gunakan model tercepat dengan latensi rendah (gemini-3.5-flash-lite ~2s, fallback gemini-3.5-flash)
-	modelsToTry := []string{"gemini-3.5-flash-lite", "gemini-3.5-flash"}
+	// Gunakan model multimodal cepat: gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.0-flash, gemini-1.5-flash
+	modelsToTry := []string{"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"}
 
 	var lastErr error
 	for _, model := range modelsToTry {
