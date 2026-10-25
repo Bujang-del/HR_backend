@@ -13,30 +13,33 @@ import (
 
 func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mailer *services.SMTPMailer, inviteRedirectURL, corsOrigins string) {
 	api := &controllers.API{Supabase: client, SupabaseAdmin: adminClient, Mailer: mailer, InviteRedirectURL: inviteRedirectURL, Gemini: services.NewGeminiService()}
-	app.Use(cors.New(cors.Config{AllowOrigins: strings.TrimSpace(corsOrigins), AllowHeaders: "Origin, Content-Type, Accept, Authorization"}))
-	app.Get("/api/index.go", func(ctx *fiber.Ctx) error {
-		return ctx.JSON(fiber.Map{
-			"status":        "ok",
-			"fiber_path":    ctx.Path(),
-			"original_url":  ctx.OriginalURL(),
-			"all_headers":   ctx.GetReqHeaders(),
-			"queries":       ctx.Queries(),
-		})
-	})
-	app.Get("/", func(ctx *fiber.Ctx) error {
-		if inviteRedirectURL != "" {
-			return ctx.Redirect(inviteRedirectURL, fiber.StatusFound)
+	// Middleware untuk menyelaraskan routing Vercel Serverless rewrite ke route asli Fiber
+	app.Use(func(c *fiber.Ctx) error {
+		target := c.Query("__path")
+		if target == "" {
+			target = c.Query("path")
 		}
+		if target != "" {
+			if !strings.HasPrefix(target, "/") {
+				target = "/" + target
+			}
+			c.Path(target)
+		}
+		return c.Next()
+	})
+
+	app.Use(cors.New(cors.Config{AllowOrigins: strings.TrimSpace(corsOrigins), AllowHeaders: "Origin, Content-Type, Accept, Authorization"}))
+	app.Get("/", func(ctx *fiber.Ctx) error {
 		return ctx.JSON(fiber.Map{
 			"status":  "ok",
-			"message": "HR Gateway Backend is running",
+			"message": "HR Gateway Backend is running on Vercel",
 			"health":  "/api/v1/health",
 		})
 	})
-	app.Get("/api", func(ctx *fiber.Ctx) error {
+	app.Get("/api/index.go", func(ctx *fiber.Ctx) error {
 		return ctx.JSON(fiber.Map{
 			"status":  "ok",
-			"message": "HR Gateway Backend API",
+			"message": "HR Gateway Backend is running on Vercel",
 			"health":  "/api/v1/health",
 		})
 	})
