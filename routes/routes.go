@@ -26,9 +26,11 @@ func Register(app *fiber.App, client, adminClient *services.SupabaseClient, mail
 	})
 	app.Get("/api", func(ctx *fiber.Ctx) error {
 		return ctx.JSON(fiber.Map{
-			"status":  "ok",
-			"message": "HR Gateway Backend API",
-			"health":  "/api/v1/health",
+			"status":       "ok",
+			"fiber_path":   ctx.Path(),
+			"original_url": ctx.OriginalURL(),
+			"query":        ctx.Queries(),
+			"headers":      ctx.GetReqHeaders(),
 		})
 	})
 	app.Get("/health", api.Health)
