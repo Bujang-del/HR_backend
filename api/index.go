@@ -3,8 +3,8 @@ package handler
 import (
 	"log"
 	"net/http"
+	"strings"
 	"sync"
-	"encoding/json"
 
 	"hr-gateway-backend/config"
 	"hr-gateway-backend/controllers"
@@ -41,26 +41,29 @@ func initialize() {
 
 // Handler is the entrypoint for Vercel Serverless Functions
 func Handler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("inspect") == "1" || r.Header.Get("X-Inspect") == "1" {
-		w.Header().Set("Content-Type", "application/json")
-		import_data := map[string]interface{}{
-			"url_path":    r.URL.Path,
-			"url_string":  r.URL.String(),
-			"request_uri": r.RequestURI,
-			"headers":     r.Header,
-		}
-		json.NewEncoder(w).Encode(import_data)
-		return
-	}
 	initOnce.Do(initialize)
 
-	// Ensure Fiber parses the exact incoming URL
-	if matched := r.Header.Get("X-Matched-Path"); matched != "" && matched != "/api" && matched != "/api/index.go" {
-		r.URL.Path = matched
-		r.RequestURI = matched
-	} else if r.URL != nil {
-		r.RequestURI = r.URL.String()
+	targetPath := r.URL.Query().Get("__path")
+	if targetPath == "" || targetPath == "/api/index.go" {
+		if matched := r.Header.Get("X-Matched-Path"); matched != "" && matched != "/api/index.go" {
+			targetPath = matched
+		}
 	}
+
+	if targetPath == "" {
+		targetPath = "/"
+	}
+
+	if !strings.HasPrefix(targetPath, "/") {
+		targetPath = "/" + targetPath
+	}
+	for strings.HasPrefix(targetPath, "//") {
+		targetPath = targetPath[1:]
+	}
+
+	// Update request path for Fiber router
+	r.URL.Path = targetPath
+	r.RequestURI = targetPath
 
 	if fiberHandler != nil {
 		fiberHandler(w, r)
