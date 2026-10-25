@@ -1,4 +1,4 @@
-package controllers
+﻿package controllers
 
 import (
 	"encoding/base64"
@@ -209,7 +209,7 @@ func (api *API) Me(ctx *fiber.Ctx) error {
 	}
 
 	user := middleware.CurrentUser(ctx)
-	if api.SupabaseAdmin != nil {
+	if (user.FullName == "" || user.Username == "") && api.SupabaseAdmin != nil {
 		var profiles []profile
 		profilePath := "/profiles?id=eq." + url.QueryEscape(user.ID) + "&select=id,email,full_name&limit=1"
 		if err := api.SupabaseAdmin.Get(ctx.Context(), profilePath, "", &profiles); err == nil && len(profiles) > 0 {
