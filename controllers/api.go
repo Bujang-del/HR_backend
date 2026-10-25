@@ -1353,6 +1353,11 @@ func (api *API) GetMyBiometricFace(ctx *fiber.Ctx) error {
 
 func (api *API) EnrollMyFace(ctx *fiber.Ctx) error {
 	user := middleware.CurrentUser(ctx)
+	m, err := api.currentMembership(ctx)
+	if err != nil {
+		return err
+	}
+
 	var body struct {
 		FaceEmbedding []float64 `json:"face_embedding"`
 		PhotoBase64   string    `json:"photo_base64"`
@@ -1360,8 +1365,8 @@ func (api *API) EnrollMyFace(ctx *fiber.Ctx) error {
 	if err := ctx.BodyParser(&body); err != nil {
 		return fiber.NewError(http.StatusBadRequest, "Payload pendaftaran wajah tidak valid.")
 	}
-	if len(body.FaceEmbedding) == 0 {
-		return fiber.NewError(http.StatusBadRequest, "Fitur embedding wajah tidak boleh kosong.")
+	if strings.TrimSpace(body.PhotoBase64) == "" {
+		return fiber.NewError(http.StatusBadRequest, "Foto wajah wajib disertakan untuk pendaftaran biometrik.")
 	}
 
 	admin := api.SupabaseAdmin
@@ -1369,29 +1374,27 @@ func (api *API) EnrollMyFace(ctx *fiber.Ctx) error {
 		admin = api.Supabase
 	}
 
-	photoURL := ""
-	if body.PhotoBase64 != "" {
-		photoBytes, err := base64.StdEncoding.DecodeString(body.PhotoBase64)
-		if err == nil && len(photoBytes) > 0 {
-			objectPath := fmt.Sprintf("%s/master.jpg", user.ID)
-			uploadedURL, uploadErr := admin.UploadStorage(ctx.Context(), "biometric-faces", objectPath, "image/jpeg", photoBytes)
-			if uploadErr == nil {
-				photoURL = uploadedURL
-			}
-		}
+	photoBytes, err := base64.StdEncoding.DecodeString(body.PhotoBase64)
+	if err != nil || len(photoBytes) == 0 {
+		return fiber.NewError(http.StatusBadRequest, "Format foto wajah tidak valid.")
+	}
+
+	objectPath := fmt.Sprintf("%s/master.jpg", user.ID)
+	uploadedURL, uploadErr := admin.UploadStorage(ctx.Context(), "biometric-faces", objectPath, "image/jpeg", photoBytes)
+	if uploadErr != nil {
+		return fiber.NewError(http.StatusInternalServerError, fmt.Sprintf("Gagal menyimpan foto wajah ke storage: %v", uploadErr))
 	}
 
 	path := "/user_biometrics?user_id=eq." + url.QueryEscape(user.ID) + "&limit=1"
 	var existing []map[string]any
 	_ = admin.Get(ctx.Context(), path, "", &existing)
 
+	now := time.Now().UTC().Format(time.RFC3339)
 	payload := map[string]any{
 		"user_id":        user.ID,
+		"face_photo_url": uploadedURL,
 		"face_embedding": body.FaceEmbedding,
-		"updated_at":     time.Now().UTC().Format(time.RFC3339),
-	}
-	if photoURL != "" {
-		payload["face_photo_url"] = photoURL
+		"updated_at":     now,
 	}
 
 	if len(existing) > 0 {
@@ -1399,38 +1402,39 @@ func (api *API) EnrollMyFace(ctx *fiber.Ctx) error {
 			return err
 		}
 	} else {
-		payload["created_at"] = time.Now().UTC().Format(time.RFC3339)
+		payload["created_at"] = now
 		if err := admin.Post(ctx.Context(), "/user_biometrics", "", payload, nil); err != nil {
 			return err
 		}
 	}
 
-	// Ajukan permohonan pendaftaran wajah ke HR agar diverifikasi
-	m, err := api.currentMembership(ctx)
-	companyID := ""
-	if err == nil {
-		companyID = m.CompanyID
-	}
+	// Masukkan pengajuan persetujuan ke antrean HR (face_reset_requests) dengan status 'pending'
 	checkPending := fmt.Sprintf("/face_reset_requests?user_id=eq.%s&status=eq.pending&limit=1", url.QueryEscape(user.ID))
-	var pendingRequests []map[string]any
-	_ = admin.Get(ctx.Context(), checkPending, "", &pendingRequests)
-	if len(pendingRequests) == 0 {
+	var pendingReqs []map[string]any
+	if err := admin.Get(ctx.Context(), checkPending, "", &pendingReqs); err == nil && len(pendingReqs) > 0 {
+		// Update permohonan pending yang sudah ada
+		reqID, _ := pendingReqs[0]["id"].(string)
+		_ = admin.Patch(ctx.Context(), "/face_reset_requests?id=eq."+url.QueryEscape(reqID), "", map[string]any{
+			"reason":     "[ENROLL] Pendaftaran Wajah Biometrik Karyawan",
+			"created_at": now,
+		}, nil)
+	} else {
 		reqPayload := map[string]any{
-			"company_id": companyID,
+			"company_id": m.CompanyID,
 			"user_id":    user.ID,
-			"reason":     "Pendaftaran wajah biometrik baru (Memerlukan verifikasi & persetujuan HR)",
+			"reason":     "[ENROLL] Pendaftaran Wajah Biometrik Karyawan",
 			"status":     "pending",
-			"created_at": time.Now().UTC().Format(time.RFC3339),
+			"created_at": now,
 		}
 		_ = admin.Post(ctx.Context(), "/face_reset_requests", "", reqPayload, nil)
 	}
 
 	return ctx.JSON(fiber.Map{
-		"message":         "Foto wajah berhasil didaftarkan dan dikirim ke HR untuk diverifikasi.",
+		"message":         "Pendaftaran wajah berhasil dikirim. Menunggu persetujuan HR sebelum dapat digunakan untuk presensi.",
 		"is_enrolled":     true,
-		"approval_status": "pending",
 		"is_approved":     false,
-		"face_photo_url":  photoURL,
+		"approval_status": "pending",
+		"face_photo_url":  uploadedURL,
 	})
 }
 
@@ -1456,10 +1460,10 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 	pathBio := "/user_biometrics?user_id=eq." + url.QueryEscape(userID) + "&limit=1"
 	var biometrics []map[string]any
 	if err := admin.Get(ctx.Context(), pathBio, "", &biometrics); err != nil || len(biometrics) == 0 {
-		return 0, false, fiber.NewError(http.StatusBadRequest, "Wajah Anda belum terdaftar di sistem. Silakan lakukan pendaftaran wajah terlebih dahulu pada menu Profil/Biometrik.")
+		return 0, false, fiber.NewError(http.StatusBadRequest, "Wajah Anda belum terdaftar di sistem. Silakan daftarkan wajah Anda terlebih dahulu.")
 	}
 
-	// 1b. Pastikan pendaftaran wajah sudah disetujui HR
+	// 2. Pastikan pendaftaran wajah sudah disetujui HR
 	checkApproval := fmt.Sprintf("/face_reset_requests?user_id=eq.%s&order=created_at.desc&limit=1", url.QueryEscape(userID))
 	var reqs []map[string]any
 	if err := admin.Get(ctx.Context(), checkApproval, "", &reqs); err == nil && len(reqs) > 0 {
@@ -1476,7 +1480,7 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 		}
 	}
 
-	// 2. Unduh foto master wajah terdaftar
+	// 3. Unduh foto master wajah terdaftar
 	var regBytes []byte
 	regBytes, _ = admin.DownloadStorage(ctx.Context(), "biometric-faces", fmt.Sprintf("%s/master.jpg", userID))
 	if len(regBytes) == 0 {
@@ -1489,7 +1493,7 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 		return 0, false, fiber.NewError(http.StatusBadRequest, "Foto master wajah terdaftar tidak ditemukan di storage. Silakan daftarkan ulang wajah Anda.")
 	}
 
-	// 3. Verifikasi biometrik dengan model AI Gemini
+	// 4. Verifikasi biometrik dengan model AI Gemini
 	result, err := api.Gemini.VerifyFace(ctx.Context(), regBytes, incomingBytes)
 	if err != nil {
 		fmt.Printf("[Gemini Face Verify Error] %v\n", err)
@@ -1499,9 +1503,9 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 	if !result.IsMatch || result.ConfidenceScore < 0.65 {
 		reason := result.Reason
 		if reason == "" {
-			reason = "Wajah tidak cocok dengan foto profil terdaftar."
+			reason = "Wajah tidak cocok dengan foto master profil terdaftar."
 		}
-		return result.ConfidenceScore, result.IsLivePerson, fiber.NewError(http.StatusUnauthorized, fmt.Sprintf("Autentikasi wajah gagal (Skor: %.1f%%): %s", result.ConfidenceScore*100, reason))
+		return result.ConfidenceScore, result.IsLivePerson, fiber.NewError(http.StatusUnauthorized, fmt.Sprintf("Autentikasi wajah gagal (Kecocokan: %.1f%%): %s", result.ConfidenceScore*100, reason))
 	}
 
 	if !result.IsLivePerson {
@@ -1519,9 +1523,9 @@ func (api *API) ClockIn(ctx *fiber.Ctx) error {
 	}
 
 	var body struct {
-		SimilarityScore  float64 `json:"similarity_score"`
-		LivenessVerified bool    `json:"liveness_verified"`
-		PhotoBase64      string  `json:"photo_base64"`
+		PhotoBase64 string   `json:"photo_base64"`
+		Latitude    *float64 `json:"latitude"`
+		Longitude   *float64 `json:"longitude"`
 	}
 	if err := ctx.BodyParser(&body); err != nil {
 		return fiber.NewError(http.StatusBadRequest, "Payload clock-in tidak valid.")
@@ -1532,8 +1536,6 @@ func (api *API) ClockIn(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	body.SimilarityScore = simScore
-	body.LivenessVerified = liveVerified
 
 	now := time.Now()
 	dateStr := now.Format("2006-01-02")
@@ -1602,9 +1604,10 @@ func (api *API) ClockIn(ctx *fiber.Ctx) error {
 		"clock_in_time":      now.UTC().Format(time.RFC3339),
 		"clock_in_photo_url": photoURL,
 		"status":             status,
-		"approval_status":    "pending",
-		"similarity_score":   body.SimilarityScore,
-		"liveness_verified":  body.LivenessVerified,
+		"approval_status":    "approved",
+		"similarity_score":   simScore,
+		"liveness_verified":  liveVerified,
+		"attendance_type":    "office",
 		"created_at":         now.UTC().Format(time.RFC3339),
 	}
 
@@ -1617,10 +1620,11 @@ func (api *API) ClockIn(ctx *fiber.Ctx) error {
 			return err
 		}
 		return ctx.JSON(fiber.Map{
-			"message":            "Clock In ulang berhasil. Menunggu verifikasi HR.",
+			"message":            "Clock In ulang berhasil diverifikasi AI.",
 			"status":             status,
 			"clock_in_time":      now.Format("15:04:05"),
 			"clock_in_photo_url": photoURL,
+			"similarity_score":   simScore,
 		})
 	}
 
@@ -1630,10 +1634,11 @@ func (api *API) ClockIn(ctx *fiber.Ctx) error {
 	}
 
 	return ctx.JSON(fiber.Map{
-		"message":            "Clock In berhasil.",
+		"message":            "Clock In berhasil diverifikasi AI Gemini.",
 		"status":             status,
 		"clock_in_time":      now.Format("15:04:05"),
 		"clock_in_photo_url": photoURL,
+		"similarity_score":   simScore,
 	})
 }
 
@@ -1658,20 +1663,16 @@ func (api *API) ClockOut(ctx *fiber.Ctx) error {
 	}
 
 	var body struct {
-		SimilarityScore  float64 `json:"similarity_score"`
-		LivenessVerified bool    `json:"liveness_verified"`
-		PhotoBase64      string  `json:"photo_base64"`
+		PhotoBase64 string   `json:"photo_base64"`
+		Latitude    *float64 `json:"latitude"`
+		Longitude   *float64 `json:"longitude"`
 	}
 	_ = ctx.BodyParser(&body)
 
-	// Verifikasi wajah biometrik dengan Gemini AI jika ada foto
-	if strings.TrimSpace(body.PhotoBase64) != "" {
-		simScore, liveVerified, err := api.verifyFaceWithGemini(ctx, user.ID, body.PhotoBase64)
-		if err != nil {
-			return err
-		}
-		body.SimilarityScore = simScore
-		body.LivenessVerified = liveVerified
+	// Verifikasi wajah biometrik kepulangan dengan Gemini AI
+	simScore, liveVerified, err := api.verifyFaceWithGemini(ctx, user.ID, body.PhotoBase64)
+	if err != nil {
+		return err
 	}
 
 	photoURL := ""
@@ -1688,8 +1689,8 @@ func (api *API) ClockOut(ctx *fiber.Ctx) error {
 
 	payload := map[string]any{
 		"clock_out_time":    now.UTC().Format(time.RFC3339),
-		"similarity_score":  body.SimilarityScore,
-		"liveness_verified": body.LivenessVerified,
+		"similarity_score":  simScore,
+		"liveness_verified": liveVerified,
 	}
 	if photoURL != "" {
 		payload["clock_out_photo_url"] = photoURL
@@ -1700,9 +1701,10 @@ func (api *API) ClockOut(ctx *fiber.Ctx) error {
 	}
 
 	return ctx.JSON(fiber.Map{
-		"message":             "Clock Out berhasil.",
+		"message":             "Clock Out berhasil diverifikasi AI Gemini. Terima kasih atas kerja keras Anda hari ini!",
 		"clock_out_time":      now.Format("15:04:05"),
 		"clock_out_photo_url": photoURL,
+		"similarity_score":    simScore,
 	})
 }
 
@@ -1738,7 +1740,7 @@ func (api *API) GetMyAttendanceHistory(ctx *fiber.Ctx) error {
 		admin = api.Supabase
 	}
 
-	path := fmt.Sprintf("/attendances?user_id=eq.%s&order=date.desc&limit=14", url.QueryEscape(user.ID))
+	path := fmt.Sprintf("/attendances?user_id=eq.%s&order=date.desc&limit=30", url.QueryEscape(user.ID))
 	var records []map[string]any
 	if err := admin.Get(ctx.Context(), path, "", &records); err != nil {
 		return err
@@ -1770,7 +1772,6 @@ func (api *API) RequestFaceReset(ctx *fiber.Ctx) error {
 		admin = api.Supabase
 	}
 
-	// Check if already has a pending request
 	checkPath := fmt.Sprintf("/face_reset_requests?user_id=eq.%s&status=eq.pending&limit=1", url.QueryEscape(user.ID))
 	var pending []map[string]any
 	if err := admin.Get(ctx.Context(), checkPath, "", &pending); err == nil && len(pending) > 0 {
@@ -1780,7 +1781,7 @@ func (api *API) RequestFaceReset(ctx *fiber.Ctx) error {
 	payload := map[string]any{
 		"company_id": m.CompanyID,
 		"user_id":    user.ID,
-		"reason":     strings.TrimSpace(body.Reason),
+		"reason":     "[RESET] " + strings.TrimSpace(body.Reason),
 		"status":     "pending",
 		"created_at": time.Now().UTC().Format(time.RFC3339),
 	}
@@ -1790,7 +1791,7 @@ func (api *API) RequestFaceReset(ctx *fiber.Ctx) error {
 	}
 
 	return ctx.JSON(fiber.Map{
-		"message": "Permohonan daftar ulang wajah berhasil dikirim ke HR.",
+		"message": "Permohonan daftar ulang wajah berhasil diajukan dan sedang menunggu persetujuan HR.",
 		"status":  "pending",
 	})
 }
@@ -1834,7 +1835,7 @@ func (api *API) ListCompanyFaceResetRequests(ctx *fiber.Ctx) error {
 		return err
 	}
 
-	// Enrich with employee profile information
+	// Enrich with employee profile information and master photo URL
 	for i := range requests {
 		if uid, ok := requests[i]["user_id"].(string); ok && uid != "" {
 			var profiles []profile
@@ -1844,6 +1845,12 @@ func (api *API) ListCompanyFaceResetRequests(ctx *fiber.Ctx) error {
 				if profiles[0].FullName != nil {
 					requests[i]["user_full_name"] = *profiles[0].FullName
 				}
+			}
+
+			var bios []map[string]any
+			bioPath := fmt.Sprintf("/user_biometrics?user_id=eq.%s&limit=1", url.QueryEscape(uid))
+			if err := admin.Get(ctx.Context(), bioPath, "", &bios); err == nil && len(bios) > 0 {
+				requests[i]["face_photo_url"] = bios[0]["face_photo_url"]
 			}
 		}
 	}
@@ -1878,7 +1885,6 @@ func (api *API) ReviewFaceResetRequest(ctx *fiber.Ctx) error {
 		admin = api.Supabase
 	}
 
-	// Get the request
 	path := fmt.Sprintf("/face_reset_requests?id=eq.%s&limit=1", url.QueryEscape(id))
 	var requests []map[string]any
 	if err := admin.Get(ctx.Context(), path, "", &requests); err != nil || len(requests) == 0 {
@@ -1886,6 +1892,7 @@ func (api *API) ReviewFaceResetRequest(ctx *fiber.Ctx) error {
 	}
 
 	targetUserID, _ := requests[0]["user_id"].(string)
+	reasonText, _ := requests[0]["reason"].(string)
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	patchPayload := map[string]any{
@@ -1899,8 +1906,10 @@ func (api *API) ReviewFaceResetRequest(ctx *fiber.Ctx) error {
 		return err
 	}
 
-	// If approved, delete the old biometrics data so employee can enroll afresh!
-	if body.Action == "approved" && targetUserID != "" {
+	// Hanya jika permohonan ini adalah permohonan RESET eksplisit (bukan pendaftaran [ENROLL]),
+	// barulah kita hapus biometrik lama agar user mendaftar baru.
+	// Jika pendaftaran wajah [ENROLL], persetujuan justru mengesahkan wajah tersebut dan TIDAK boleh dihapus!
+	if body.Action == "approved" && targetUserID != "" && strings.HasPrefix(reasonText, "[RESET]") {
 		bioPath := fmt.Sprintf("/user_biometrics?user_id=eq.%s", url.QueryEscape(targetUserID))
 		_ = admin.Delete(ctx.Context(), bioPath, "", nil)
 	}
@@ -1992,6 +2001,7 @@ func (api *API) ReviewAttendance(ctx *fiber.Ctx) error {
 		"approval_status": body.ApprovalStatus,
 	})
 }
+
 
 // ==========================================
 // FITUR PENGAJUAN & MANAJEMEN CUTI
