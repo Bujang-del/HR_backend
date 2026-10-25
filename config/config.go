@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/joho/godotenv"
@@ -28,8 +27,18 @@ func Load() (Config, error) {
 	if baseURL == "" {
 		baseURL = os.Getenv("SUPABASE_DB_URL")
 	}
-	if baseURL == "" || os.Getenv("SUPABASE_ANON_KEY") == "" {
-		return Config{}, fmt.Errorf("SUPABASE_URL/SUPABASE_DB_URL and SUPABASE_ANON_KEY are required")
+	if baseURL == "" {
+		baseURL = "https://asscrzeikrmjpkwicxuo.supabase.co"
+	}
+
+	anonKey := os.Getenv("SUPABASE_ANON_KEY")
+	if anonKey == "" {
+		anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFzc2NyemVpa3JtanBrd2ljeHVvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk2MDkxODQsImV4cCI6MjEwNTE4NTE4NH0.8SIVnhALw2ho23bFIQfgKFRFu9DtER9OfhCX18icfxQ"
+	}
+
+	serviceRoleKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+	if serviceRoleKey == "" {
+		serviceRoleKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFzc2NyemVpa3JtanBrd2ljeHVvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4OTYwOTE4NCwiZXhwIjoyMTA1MTg1MTg0fQ.X0fbx4siD_Wvd2TCfuojXXmqP2gvzUYUGdGeumajTpY"
 	}
 
 	port := os.Getenv("PORT")
@@ -44,15 +53,15 @@ func Load() (Config, error) {
 	return Config{
 		Port:                   port,
 		SupabaseURL:            baseURL,
-		SupabaseAnonKey:        os.Getenv("SUPABASE_ANON_KEY"),
-		SupabaseServiceRoleKey: os.Getenv("SUPABASE_SERVICE_ROLE_KEY"),
+		SupabaseAnonKey:        anonKey,
+		SupabaseServiceRoleKey: serviceRoleKey,
 		InviteBaseURL:          os.Getenv("INVITE_REDIRECT_URL"),
 		CORSOrigins:            origins,
-		SMTPHost:               os.Getenv("SMTP_HOST"),
+		SMTPHost:               envOrDefault("SMTP_HOST", "smtp.gmail.com"),
 		SMTPPort:               envOrDefault("SMTP_PORT", "587"),
-		SMTPUsername:           os.Getenv("SMTP_USERNAME"),
-		SMTPPassword:           os.Getenv("SMTP_PASSWORD"),
-		SMTPFrom:               os.Getenv("SMTP_FROM"),
+		SMTPUsername:           envOrDefault("SMTP_USERNAME", "sibabihutan5@gmail.com"),
+		SMTPPassword:           envOrDefault("SMTP_PASSWORD", "twomrzdcxemvghgo"),
+		SMTPFrom:               envOrDefault("SMTP_FROM", "Gateway HR <sibabihutan5@gmail.com>"),
 	}, nil
 }
 

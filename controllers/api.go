@@ -168,10 +168,15 @@ func (api *API) Login(ctx *fiber.Ctx) error {
 		Password string `json:"password"`
 	}
 	if err := ctx.BodyParser(&input); err != nil || strings.TrimSpace(input.Email) == "" || input.Password == "" {
-		return fiber.ErrBadRequest
+		return fiber.NewError(fiber.StatusBadRequest, "Email dan kata sandi wajib diisi.")
 	}
 	var session map[string]any
 	if err := api.Supabase.PasswordLogin(ctx.Context(), strings.ToLower(strings.TrimSpace(input.Email)), input.Password, &session); err != nil {
+		if httpErr, ok := err.(*services.HTTPError); ok {
+			if httpErr.Status == http.StatusBadRequest || httpErr.Status == http.StatusUnauthorized {
+				return fiber.NewError(fiber.StatusUnauthorized, "Email atau kata sandi tidak valid.")
+			}
+		}
 		return err
 	}
 	return ctx.JSON(session)
