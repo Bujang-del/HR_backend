@@ -45,15 +45,20 @@ func NewGeminiService() *GeminiService {
 	}
 }
 
-// optimizeImage memperkecil dimensi dan mengompresi gambar JPEG untuk efisiensi payload dan menghindari timeout pada Gemini API
+// optimizeImage memperkecil dimensi dan mengompresi gambar JPEG hanya jika ukuran file terlalu besar (> 1MB)
+// agar detail fitur biometrik wajah (mata, hidung, rahang, filtrum) tetap tajam tanpa artefak
 func optimizeImage(input []byte, maxDim int, quality int) []byte {
 	if len(input) == 0 {
 		return input
 	}
 
+	// Jika ukuran file sudah di bawah 1MB, gunakan file asli tanpa downscaling
+	if len(input) <= 1024*1024 {
+		return input
+	}
+
 	img, _, err := image.Decode(bytes.NewReader(input))
 	if err != nil {
-		// Jika decode gagal atau format non-standar, gunakan bytes asli
 		return input
 	}
 
@@ -61,8 +66,7 @@ func optimizeImage(input []byte, maxDim int, quality int) []byte {
 	w := bounds.Dx()
 	h := bounds.Dy()
 
-	// Jika dimensi sudah kecil dan ukuran file < 250KB, langsung pakai
-	if w <= maxDim && h <= maxDim && len(input) <= 250*1024 {
+	if w <= maxDim && h <= maxDim {
 		return input
 	}
 
@@ -112,38 +116,49 @@ func (g *GeminiService) VerifyFace(ctx context.Context, registeredPhotoBytes, at
 		return nil, fmt.Errorf("GEMINI_API_KEY belum dikonfigurasi di environment (.env)")
 	}
 
-	// Kompresi dan optimalkan gambar agar payload ringan (< 100 KB) dan respon Gemini instan
-	regOpt := optimizeImage(registeredPhotoBytes, 640, 75)
-	attOpt := optimizeImage(attendancePhotoBytes, 640, 75)
+	// Optimalkan gambar jika terlalu besar (> 1MB), pertahankan resolusi tajam untuk fitur biometrik
+	regOpt := optimizeImage(registeredPhotoBytes, 1024, 85)
+	attOpt := optimizeImage(attendancePhotoBytes, 1024, 85)
 
 	regBase64 := base64.StdEncoding.EncodeToString(regOpt)
 	attBase64 := base64.StdEncoding.EncodeToString(attOpt)
 
-	prompt := `Anda adalah model AI pakar biometrik untuk verifikasi wajah sistem presensi kehadiran.
-Tugas Anda:
-Bandingkan dua gambar berikut secara seksama:
-- Gambar 1 (Foto Master / Terdaftar): Foto referensi profil karyawan yang sah dan terdaftar di database.
-- Gambar 2 (Foto Presensi / Selfie): Foto selfie yang baru saja diambil saat melakukan presensi (Clock In / Clock Out).
+	prompt := `Anda adalah sistem keamanan biometrik wajah (1:1 Facial Recognition Verification) berstandar industri untuk absensi kehadiran karyawan.
+Tugas Anda: Memverifikasi secara kritis dan teliti apakah orang pada [FOTO 2: SELFIE PRESENSI] adalah ORANG YANG SAMA PERSIS (INDIVIDU IDENTIK) dengan karyawan sah pada [FOTO 1: MASTER REFERENSI].
 
-Kriteria Penilaian:
-1. Analisis kecocokan biometrik: bentuk wajah, mata, hidung, garis bibir, dan kontur rahang.
-2. Berikan toleransi wajar untuk perbedaan ekspresi (senyum/netral), pencahayaan ruangan, pemakaian kacamata, atau gaya rambut. Jika fitur struktur wajah sama, maka is_match = true.
-3. Anti-Spoofing: Pastikan Gambar 2 diambil langsung dari orang nyata, bukan foto dari layar HP lain atau cetakan kertas.
-4. Berikan confidence_score antara 0.0 (sama sekali tidak cocok) sampai 1.0 (sangat yakin orang yang sama).
+PANDUAN BIOMETRIK KETAT (PENCEGAHAN JOKI ABSENSI):
+1. WASPADAI KECURANGAN: Teman, rekan kerja, saudara, atau orang lain yang mencoba melakukan presensi mewakili karyawan WAJIB DITOLAK!
+2. Kemiripan jenis kelamin, usia, warna kulit, bentuk rambut, atau kumis/jenggot BUKAN bukti bahwa mereka adalah orang yang sama. Banyak orang memiliki ras atau karakteristik umum yang mirip.
+3. Fokuslah menganalisis fitur struktural biologis permanen:
+   - Bentuk dan jarak mata (canthus bagian dalam, kelopak mata, bentuk kantung mata).
+   - Bentuk hidung (lebar tulang hidung, lekukan cuping hidung, ujung hidung).
+   - Bentuk bibir, filtrum (lekukan di atas bibir), dan proporsi dagu.
+   - Kontur tulang pipi, pelipis, dan garis rahang bawah.
+4. Liveness / Anti-Spoofing: Pastikan Foto 2 adalah orang hidup yang sedang difoto langsung di depan kamera smartphone, bukan foto dari layar monitor/HP lain, dan bukan cetakan kertas foto.
 
-Keluarkan HANYA JSON valid (tanpa markdown ataupun petik tambahan) dengan format:
+ATURAN PENILAIAN & OUTPUT:
+- JIKA ORANG BERBEDA (teman/orang lain yang mirip):
+  * "is_match": false
+  * "confidence_score": 0.01 - 0.35 (wajib di bawah 0.40)
+  * "reason": Sebutkan perbedaan spesifik (misal: "Wajah berbeda: bentuk hidung, jarak mata, dan kontur rahang tidak cocok dengan karyawan terdaftar").
+- HANYA JIKA ANDA 100% YAKIN MEREKA ORANG YANG SAMA PERSIS (hanya beda ekspresi/pencahayaan wajar):
+  * "is_match": true
+  * "confidence_score": 0.80 - 1.00
+  * "reason": "Verifikasi biometrik cocok: fitur mata, hidung, bibir, dan rahang identik dengan karyawan terdaftar."
+
+Format keluaran WAJIB JSON murni:
 {
   "is_match": boolean,
   "confidence_score": float,
   "is_live_person": boolean,
-  "reason": "Penjelasan singkat dalam bahasa Indonesia"
+  "reason": "Penjelasan hasil verifikasi dalam bahasa Indonesia"
 }`
 
-	// Gunakan model multimodal aktif dan terverifikasi di Google Generative Language API
+	// Urutan model: gunakan flash lite terlebih dahulu untuk respon kilat dan kuota stabil
 	modelsToTry := []string{
+		"gemini-flash-lite-latest",
 		"gemini-3.5-flash",
 		"gemini-3.8-flash",
-		"gemini-flash-lite-latest",
 		"gemini-3-flash-preview",
 	}
 
@@ -155,25 +170,28 @@ Keluarkan HANYA JSON valid (tanpa markdown ataupun petik tambahan) dengan format
 			"contents": []map[string]any{
 				{
 					"parts": []map[string]any{
-						{"text": prompt},
+						{"text": "=== SISTEM VERIFIKASI BIOMETRIK WAJAH 1:1 ==="},
+						{"text": "[FOTO 1: MASTER REFERENSI KARYAWAN TERDAFTAR DI DATABASE]"},
 						{
 							"inline_data": map[string]string{
 								"mime_type": "image/jpeg",
 								"data":      regBase64,
 							},
 						},
+						{"text": "[FOTO 2: SELFIE PRESENSI SAAT INI (CLOCK IN / CLOCK OUT)]"},
 						{
 							"inline_data": map[string]string{
 								"mime_type": "image/jpeg",
 								"data":      attBase64,
 							},
 						},
+						{"text": prompt},
 					},
 				},
 			},
 			"generationConfig": map[string]any{
 				"response_mime_type": "application/json",
-				"temperature":        0.1,
+				"temperature":        0.0,
 			},
 		}
 

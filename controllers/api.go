@@ -1519,13 +1519,16 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 		return 0, false, fiber.NewError(http.StatusServiceUnavailable, "Gagal memverifikasi biometrik wajah dengan AI. Silakan coba kembali dalam beberapa saat.")
 	}
 
-	if !result.IsMatch || result.ConfidenceScore < 0.60 {
+	if !result.IsMatch || result.ConfidenceScore < 0.75 {
 		reason := result.Reason
 		if reason == "" {
 			reason = "Wajah tidak cocok dengan foto profil terdaftar."
 		}
+		fmt.Printf("[Gemini Face Verify REJECTED] UserID: %s, Score: %.2f, Reason: %s\n", userID, result.ConfidenceScore, reason)
 		return result.ConfidenceScore, result.IsLivePerson, fiber.NewError(http.StatusUnauthorized, fmt.Sprintf("Verifikasi wajah tidak cocok (Kemiripan: %.1f%%): %s", result.ConfidenceScore*100, reason))
 	}
+
+	fmt.Printf("[Gemini Face Verify ACCEPTED] UserID: %s, Score: %.2f, Reason: %s\n", userID, result.ConfidenceScore, result.Reason)
 
 	if !result.IsLivePerson {
 		return result.ConfidenceScore, false, fiber.NewError(http.StatusUnauthorized, "Autentikasi gagal: Foto harus berupa wajah orang asli langsung di depan kamera (Anti-Spoofing).")
