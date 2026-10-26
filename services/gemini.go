@@ -139,8 +139,13 @@ Keluarkan HANYA JSON valid (tanpa markdown ataupun petik tambahan) dengan format
   "reason": "Penjelasan singkat dalam bahasa Indonesia"
 }`
 
-	// Gunakan model multimodal cepat: gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.0-flash, gemini-1.5-flash
-	modelsToTry := []string{"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"}
+	// Gunakan model multimodal aktif dan terverifikasi di Google Generative Language API
+	modelsToTry := []string{
+		"gemini-3.5-flash",
+		"gemini-3.8-flash",
+		"gemini-flash-lite-latest",
+		"gemini-3-flash-preview",
+	}
 
 	var lastErr error
 	for _, model := range modelsToTry {

@@ -1,4 +1,4 @@
-﻿package controllers
+package controllers
 
 import (
 	"encoding/base64"
@@ -187,18 +187,30 @@ func (api *API) Me(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	isManager := len(m.ManagedDepartments) > 0
+	isManager := m.Role == "manager" || len(m.ManagedDepartments) > 0
 	var managedDept *departmentSummary
-	if isManager {
+	if len(m.ManagedDepartments) > 0 {
 		managedDept = &m.ManagedDepartments[0]
+	} else if isManager && m.Department != nil {
+		managedDept = m.Department
 	}
 
 	// Hitung display_position = position_title + " " + department_code
-	// Contoh: "Manager" + " " + "SDM" â†’ "Manager SDM"
-	//         "Staff"   + " " + "FI"  â†’ "Staff FI"
+	// Contoh: "Manager" + " " + "SDM" -> "Manager SDM"
+	//         "Staff"   + " " + "FI"  -> "Staff FI"
 	displayPosition := ""
 	if m.PositionTitle != nil {
 		displayPosition = strings.TrimSpace(*m.PositionTitle)
+	}
+	if displayPosition == "" {
+		switch m.Role {
+		case "manager":
+			displayPosition = "Manager"
+		case "hr":
+			displayPosition = "HR"
+		default:
+			displayPosition = "Staff"
+		}
 	}
 	if m.Department != nil && m.Department.Code != "" {
 		if displayPosition != "" {
@@ -399,7 +411,18 @@ func (api *API) UpdateMember(ctx *fiber.Ctx) error {
 		memberPayload["position_title"] = strings.TrimSpace(*input.PositionTitle)
 	}
 	if input.Role != nil {
-		memberPayload["role"] = normalizeRole(*input.Role)
+		newRole := normalizeRole(*input.Role)
+		memberPayload["role"] = newRole
+		// Jika role diubah menjadi manager dan posisi belum/masih staff, sinkronkan ke Manager
+		if newRole == "manager" && (input.PositionTitle == nil || *input.PositionTitle == "" || *input.PositionTitle == "Staff") {
+			memberPayload["position_title"] = "Manager"
+		} else if newRole == "employee" && (input.PositionTitle == nil || *input.PositionTitle == "Manager") {
+			memberPayload["position_title"] = "Staff"
+		}
+		// Jika diturunkan dari manager, lepaskan jabatannya dari manager departemen
+		if newRole != "manager" && memberRecord.Role == "manager" {
+			_ = client.Patch(ctx.Context(), "/departments?company_id="+url.QueryEscape(membership.CompanyID)+"&manager_id=eq."+url.QueryEscape(memberID), token, fiber.Map{"manager_id": nil}, nil)
+		}
 	}
 	if len(memberPayload) > 0 {
 		var dummy []map[string]any
@@ -449,10 +472,7 @@ func (api *API) AddMember(ctx *fiber.Ctx) error {
 	if err := ctx.BodyParser(&input); err != nil || strings.TrimSpace(input.Email) == "" {
 		return fiber.ErrBadRequest
 	}
-	role := input.Role
-	if role != "hr" {
-		role = "employee"
-	}
+	role := normalizeRole(input.Role)
 	email := strings.ToLower(strings.TrimSpace(input.Email))
 	fullName := strings.TrimSpace(input.FullName)
 	username := strings.TrimSpace(input.Username)
@@ -463,9 +483,19 @@ func (api *API) AddMember(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	position := input.PositionTitle
+	position := strings.TrimSpace(input.PositionTitle)
 	if position == "" {
-		position = input.Position
+		position = strings.TrimSpace(input.Position)
+	}
+	if position == "" {
+		switch role {
+		case "manager":
+			position = "Manager"
+		case "hr":
+			position = "HR"
+		default:
+			position = "Staff"
+		}
 	}
 	member, _, err := api.upsertMember(ctx, membership.CompanyID, userID, role, position, input.DepartmentID)
 	if err != nil {
@@ -675,10 +705,14 @@ func (api *API) upsertMember(ctx *fiber.Ctx, companyID, userID, role, position s
 }
 
 func normalizeRole(role string) string {
-	if strings.ToLower(strings.TrimSpace(role)) == "hr" {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "hr":
 		return "hr"
+	case "manager":
+		return "manager"
+	default:
+		return "employee"
 	}
-	return "employee"
 }
 
 func (api *API) client(ctx *fiber.Ctx) (*services.SupabaseClient, string) {
@@ -767,14 +801,14 @@ func (api *API) SetDepartmentManager(ctx *fiber.Ctx) error {
 		oldManagerID = existingDepts[0].ManagerID
 	}
 
-	// 2. Jika manager lama berbeda dengan manager baru, turunkan jabatan manager lama menjadi "Staff"
+	// 2. Jika manager lama berbeda dengan manager baru, turunkan jabatan manager lama menjadi "Staff" dan role "employee"
 	if oldManagerID != nil && *oldManagerID != "" {
 		if input.ManagerID == nil || *input.ManagerID != *oldManagerID {
 			oldMemberPath := "/company_members?id=eq." + url.QueryEscape(*oldManagerID) +
 				"&company_id=eq." + url.QueryEscape(membership.CompanyID)
 			var updatedOld []map[string]any
 			_ = client.Patch(ctx.Context(), oldMemberPath, token,
-				fiber.Map{"position_title": "Staff"}, &updatedOld)
+				fiber.Map{"role": "employee", "position_title": "Staff"}, &updatedOld)
 		}
 	}
 
@@ -795,14 +829,14 @@ func (api *API) SetDepartmentManager(ctx *fiber.Ctx) error {
 		return err
 	}
 
-	// 5. Jika ada manager baru, otomatis update position_title-nya menjadi "Manager"
+	// 5. Jika ada manager baru, otomatis update role menjadi "manager" dan position_title menjadi "Manager"
 	if input.ManagerID != nil && *input.ManagerID != "" {
 		memberPath := "/company_members?id=eq." + url.QueryEscape(*input.ManagerID) +
 			"&company_id=eq." + url.QueryEscape(membership.CompanyID)
 		var updated []map[string]any
 		// Best-effort: abaikan error agar response utama tidak gagal
 		_ = client.Patch(ctx.Context(), memberPath, token,
-			fiber.Map{"position_title": "Manager"}, &updated)
+			fiber.Map{"role": "manager", "position_title": "Manager"}, &updated)
 	}
 
 	return ctx.JSON(firstMap(departments))
@@ -853,12 +887,12 @@ func (api *API) AssignMemberDepartment(ctx *fiber.Ctx) error {
 		_ = client.Get(ctx.Context(), targetPath, token, &targetDepts)
 
 		if len(targetDepts) > 0 && targetDepts[0].ManagerID != nil && *targetDepts[0].ManagerID != memberID {
-			// Turunkan manager saat ini menjadi Staff
+			// Turunkan manager saat ini menjadi Staff & role employee
 			oldManagerPath := "/company_members?id=eq." + url.QueryEscape(*targetDepts[0].ManagerID) +
 				"&company_id=eq." + url.QueryEscape(membership.CompanyID)
 			var updatedOld []map[string]any
 			_ = client.Patch(ctx.Context(), oldManagerPath, token,
-				fiber.Map{"position_title": "Staff"}, &updatedOld)
+				fiber.Map{"role": "employee", "position_title": "Staff"}, &updatedOld)
 		}
 
 		// Update manager_id departemen tujuan
@@ -866,15 +900,17 @@ func (api *API) AssignMemberDepartment(ctx *fiber.Ctx) error {
 		_ = client.Patch(ctx.Context(), "/departments?id=eq."+url.QueryEscape(targetDeptID)+"&company_id=eq."+url.QueryEscape(membership.CompanyID),
 			token, fiber.Map{"manager_id": memberID}, &updatedDepts)
 
+		patchMember["role"] = "manager"
 		patchMember["position_title"] = "Manager"
 	} else if input.AsManager != nil && !*input.AsManager {
 		// Secara eksplisit dipilih sebagai Staff (bukan manager)
+		patchMember["role"] = "employee"
 		if input.PositionTitle == nil || *input.PositionTitle == "" || *input.PositionTitle == "Manager" {
 			patchMember["position_title"] = "Staff"
 		}
 	} else {
 		// Default: jika departemen tujuan sudah memiliki manager lain dan jabatan member saat ini adalah "Manager",
-		// ubah otomatis menjadi "Staff" agar tidak ada duplikasi Manager di satu departemen
+		// ubah otomatis menjadi "Staff" dan role "employee" agar tidak ada duplikasi Manager di satu departemen
 		if input.DepartmentID != nil && *input.DepartmentID != "" {
 			var targetDepts []struct {
 				ManagerID *string `json:"manager_id"`
@@ -890,6 +926,7 @@ func (api *API) AssignMemberDepartment(ctx *fiber.Ctx) error {
 			isTargetHasOtherManager := len(targetDepts) > 0 && targetDepts[0].ManagerID != nil && *targetDepts[0].ManagerID != memberID
 			if isTargetHasOtherManager {
 				if len(currentMemberData) > 0 && currentMemberData[0].PositionTitle != nil && strings.EqualFold(*currentMemberData[0].PositionTitle, "Manager") {
+					patchMember["role"] = "employee"
 					patchMember["position_title"] = "Staff"
 				}
 			}
@@ -996,6 +1033,16 @@ func (api *API) currentMembership(ctx *fiber.Ctx) (membership, error) {
 		} else {
 			memberships[0].LeaveBalance = memberships[0].LeaveQuota - memberships[0].LeaveTaken
 		}
+	}
+
+	// Sinkronisasi role dan managed_departments:
+	// Jika mengelola departemen dan bukan HR, pastikan role adalah "manager"
+	if len(memberships[0].ManagedDepartments) > 0 && memberships[0].Role != "hr" {
+		memberships[0].Role = "manager"
+	}
+	// Jika role manager tapi managed_departments belum terpopulasi, gunakan departemen member saat ini
+	if memberships[0].Role == "manager" && len(memberships[0].ManagedDepartments) == 0 && memberships[0].Department != nil {
+		memberships[0].ManagedDepartments = []departmentSummary{*memberships[0].Department}
 	}
 
 	return memberships[0], nil
@@ -1468,10 +1515,8 @@ func (api *API) verifyFaceWithGemini(ctx *fiber.Ctx, userID string, incomingPhot
 	// 3. Verifikasi biometrik dengan model AI Gemini Vision
 	result, err := api.Gemini.VerifyFace(ctx.Context(), regBytes, incomingBytes)
 	if err != nil {
-		// Log error AI
-		fmt.Printf("[Gemini Face Verify Error / Fallback] %v\n", err)
-		// Jika terjadi gangguan timeout/koneksi AI eksternal, izinkan presensi dengan flag review
-		return 0.85, true, nil
+		fmt.Printf("[Gemini Face Verify Error] %v\n", err)
+		return 0, false, fiber.NewError(http.StatusServiceUnavailable, "Gagal memverifikasi biometrik wajah dengan AI. Silakan coba kembali dalam beberapa saat.")
 	}
 
 	if !result.IsMatch || result.ConfidenceScore < 0.60 {
@@ -2127,7 +2172,8 @@ func (api *API) GetManagerPendingLeaves(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if len(m.ManagedDepartments) == 0 {
+	isManager := m.Role == "manager" || len(m.ManagedDepartments) > 0
+	if !isManager {
 		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
 	}
 	admin := api.SupabaseAdmin
@@ -2135,9 +2181,12 @@ func (api *API) GetManagerPendingLeaves(ctx *fiber.Ctx) error {
 		admin = api.Supabase
 	}
 
-	managedDeptIDs := make([]string, len(m.ManagedDepartments))
-	for i, d := range m.ManagedDepartments {
-		managedDeptIDs[i] = d.ID
+	managedDeptIDs := make([]string, 0, len(m.ManagedDepartments))
+	for _, d := range m.ManagedDepartments {
+		managedDeptIDs = append(managedDeptIDs, d.ID)
+	}
+	if len(managedDeptIDs) == 0 && m.DepartmentID != nil && *m.DepartmentID != "" {
+		managedDeptIDs = append(managedDeptIDs, *m.DepartmentID)
 	}
 
 	deptFilter := strings.Join(managedDeptIDs, ",")
@@ -2190,7 +2239,8 @@ func (api *API) ReviewLeaveByManager(ctx *fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	if len(m.ManagedDepartments) == 0 {
+	isManager := m.Role == "manager" || len(m.ManagedDepartments) > 0
+	if !isManager {
 		return fiber.NewError(http.StatusForbidden, "Akses hanya untuk Manager Departemen.")
 	}
 	var input managerReviewLeaveInput
@@ -2528,7 +2578,7 @@ func (api *API) CreateWFARequest(ctx *fiber.Ctx) error {
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	isManagerApplicant := len(m.ManagedDepartments) > 0
+	isManagerApplicant := m.Role == "manager" || len(m.ManagedDepartments) > 0
 	initialStatus := "pending_manager"
 	if isManagerApplicant {
 		// Jika manager yang mengajukan WFA, maka approval langsung di dashboard HR
@@ -2863,14 +2913,20 @@ func (api *API) SubmitWFACompletion(ctx *fiber.Ctx) error {
 		}
 	}
 
+	isManagerApplicant, _ := reqData["is_manager_applicant"].(bool)
 	now := time.Now().UTC().Format(time.RFC3339)
 	_ = admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(reqID), "", map[string]any{
 		"status":     "submitted_for_review",
 		"updated_at": now,
 	}, nil)
 
+	msg := "Laporan tugas WFA selesai berhasil dikirimkan ke Manager untuk diperiksa dan di-ACC."
+	if isManagerApplicant {
+		msg = "Laporan tugas WFA selesai berhasil dikirimkan ke HR untuk diperiksa dan di-ACC."
+	}
+
 	return ctx.JSON(fiber.Map{
-		"message": "Laporan tugas WFA selesai berhasil dikirimkan ke Manager untuk diperiksa dan di-ACC.",
+		"message": msg,
 		"status":  "submitted_for_review",
 	})
 }
@@ -2901,6 +2957,11 @@ func (api *API) ApproveWFACompletionByManager(ctx *fiber.Ctx) error {
 	}
 	wfaReq := reqs[0]
 	applicantUserID, _ := wfaReq["user_id"].(string)
+	applicantMemberID, _ := wfaReq["member_id"].(string)
+	isManagerApp, _ := wfaReq["is_manager_applicant"].(bool)
+	if applicantUserID == user.ID || applicantMemberID == m.MemberID || isManagerApp {
+		return fiber.NewError(http.StatusForbidden, "Penyelesaian WFA untuk Manager harus disetujui oleh HR, tidak dapat menyetujui permohonan sendiri.")
+	}
 	reqDate, _ := wfaReq["date"].(string)
 	now := time.Now().UTC().Format(time.RFC3339)
 
@@ -3017,12 +3078,22 @@ func (api *API) GetManagerPendingWFARequests(ctx *fiber.Ctx) error {
 		}
 	}
 
-	// Ambil permohonan WFA: jika owner/admin atau jika filter departemen kosong, ambil seluruh permohonan WFA perusahaan
+	// Ambil permohonan WFA: jika owner/admin, ambil seluruh permohonan WFA perusahaan
 	var wfaPath string
-	if (m.Role == "owner" || m.Role == "admin") || len(memberIDs) == 0 {
+	if m.Role == "owner" || m.Role == "admin" {
 		wfaPath = "/wfa_requests?company_id=eq." + url.QueryEscape(m.CompanyID) + "&order=created_at.desc"
 	} else {
-		wfaPath = "/wfa_requests?member_id=in.(" + strings.Join(memberIDs, ",") + ")&order=created_at.desc"
+		// Filter anggota departemen dan pastikan tidak menampilkan permohonan milik manager itu sendiri
+		cleanMemberIDs := make([]string, 0, len(memberIDs))
+		for _, id := range memberIDs {
+			if id != m.MemberID {
+				cleanMemberIDs = append(cleanMemberIDs, id)
+			}
+		}
+		if len(cleanMemberIDs) == 0 {
+			return ctx.JSON([]any{})
+		}
+		wfaPath = "/wfa_requests?member_id=in.(" + strings.Join(cleanMemberIDs, ",") + ")&is_manager_applicant=eq.false&order=created_at.desc"
 	}
 
 	var requests []map[string]any
@@ -3121,6 +3192,13 @@ func (api *API) ReviewWFAByManager(ctx *fiber.Ctx) error {
 	var reqs []map[string]any
 	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
 		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
+	}
+	wfaReq := reqs[0]
+	applicantUserID, _ := wfaReq["user_id"].(string)
+	applicantMemberID, _ := wfaReq["member_id"].(string)
+	isManagerApp, _ := wfaReq["is_manager_applicant"].(bool)
+	if applicantUserID == user.ID || applicantMemberID == m.MemberID || isManagerApp {
+		return fiber.NewError(http.StatusForbidden, "Permohonan WFA untuk Manager harus disetujui oleh HR, tidak dapat menyetujui permohonan sendiri.")
 	}
 
 	if input.Action == "approve" {
@@ -3325,16 +3403,94 @@ func (api *API) ReviewWFAByHR(ctx *fiber.Ctx) error {
 	if err := admin.Get(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID)+"&limit=1", "", &reqs); err != nil || len(reqs) == 0 {
 		return fiber.NewError(http.StatusNotFound, "Permohonan WFA tidak ditemukan.")
 	}
+	wfaReq := reqs[0]
+	currentStatus, _ := wfaReq["status"].(string)
+	applicantUserID, _ := wfaReq["user_id"].(string)
+	reqDate, _ := wfaReq["date"].(string)
 
-	newStatus := "approved"
-	msg := "Permohonan WFA telah disetujui (ACC) oleh HR. Karyawan dapat melaksanakan WFA."
 	if input.Action == "reject" {
-		newStatus = "rejected"
-		msg = "Permohonan WFA telah ditolak oleh HR."
+		updatePayload := map[string]any{
+			"status":       "rejected",
+			"hr_id":        m.MemberID,
+			"hr_name":      user.FullName,
+			"hr_notes":     strings.TrimSpace(input.Notes),
+			"hr_action_at": now,
+			"updated_at":   now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+		return ctx.JSON(fiber.Map{
+			"message": "Permohonan WFA telah ditolak oleh HR.",
+			"data":    firstMap(updated),
+		})
 	}
 
+	// input.Action == "approve"
+	if currentStatus == "submitted_for_review" {
+		// ACC Penyelesaian Tugas WFA (untuk Manager atau karyawan yang dikonfirmasi HR)
+		var existingAtt []map[string]any
+		_ = admin.Get(ctx.Context(), "/attendances?user_id=eq."+url.QueryEscape(applicantUserID)+"&date=eq."+url.QueryEscape(reqDate)+"&limit=1", "", &existingAtt)
+
+		var attID string
+		if len(existingAtt) == 0 {
+			clockInTime, _ := wfaReq["created_at"].(string)
+			if clockInTime == "" {
+				clockInTime = now
+			}
+			attPayload := map[string]any{
+				"company_id":        m.CompanyID,
+				"user_id":           applicantUserID,
+				"date":              reqDate,
+				"clock_in_time":     clockInTime,
+				"clock_out_time":    now,
+				"status":            "on_time",
+				"approval_status":   "approved",
+				"attendance_type":   "wfa",
+				"similarity_score":  1.0,
+				"liveness_verified": true,
+				"created_at":        now,
+			}
+			var createdAtt []map[string]any
+			if err := admin.Post(ctx.Context(), "/attendances", "", attPayload, &createdAtt); err == nil && len(createdAtt) > 0 {
+				if idVal, ok := createdAtt[0]["id"].(string); ok {
+					attID = idVal
+				}
+			}
+		} else {
+			attID, _ = existingAtt[0]["id"].(string)
+			_ = admin.Patch(ctx.Context(), "/attendances?id=eq."+url.QueryEscape(attID), "", map[string]any{
+				"clock_out_time":  now,
+				"attendance_type": "wfa",
+				"approval_status": "approved",
+			}, nil)
+		}
+
+		updatePayload := map[string]any{
+			"status":        "completed",
+			"hr_id":         m.MemberID,
+			"hr_name":       user.FullName,
+			"hr_notes":      strings.TrimSpace(input.Notes),
+			"hr_action_at":  now,
+			"attendance_id": attID,
+			"updated_at":    now,
+		}
+		var updated []map[string]any
+		if err := admin.Patch(ctx.Context(), "/wfa_requests?id=eq."+url.QueryEscape(requestID), "", updatePayload, &updated); err != nil {
+			return err
+		}
+		return ctx.JSON(fiber.Map{
+			"message":       "Penyelesaian WFA disetujui oleh HR! Kehadiran telah resmi dicatat sebagai Masuk Kerja (Hadir WFA).",
+			"attendance_id": attID,
+			"status":        "completed",
+			"data":          firstMap(updated),
+		})
+	}
+
+	// Status awal: pending_hr (permohonan izin WFA awal)
 	updatePayload := map[string]any{
-		"status":       newStatus,
+		"status":       "approved",
 		"hr_id":        m.MemberID,
 		"hr_name":      user.FullName,
 		"hr_notes":     strings.TrimSpace(input.Notes),
@@ -3348,7 +3504,7 @@ func (api *API) ReviewWFAByHR(ctx *fiber.Ctx) error {
 	}
 
 	return ctx.JSON(fiber.Map{
-		"message": msg,
+		"message": "Permohonan WFA telah disetujui (ACC) oleh HR. Karyawan dapat melaksanakan WFA.",
 		"data":    firstMap(updated),
 	})
 }
